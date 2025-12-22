@@ -33,3 +33,14 @@ cache/
 
 # ---- System ----
 *.pid
+
+# ---- Viking AI generated/runtime/state ----
+*.bak.*
+*.db
+*.sqlite
+*.sqlite3
+*.json
+*.csv
+*.txt
+
+# If you want to track specific files later, we can whitelist with !filename.ext
