@@ -24,3 +24,24 @@ logs/
 .DS_Store
 .idea/
 .vscode/
+# Logs / runtime outputs
+*.log
+*.txt
+*.json
+*.csv
+
+# Backups
+*.bak.*
+backups/
+
+# Local runtime state
+data/
+logs/
+
+# Ignore most json runtime/state files
+*.json
+
+# BUT keep real config tracked
+!config.json
+!render.yaml
+
