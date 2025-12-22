@@ -1,48 +1,35 @@
-# Python
+# ---- Secrets ----
+.env
+.env.*
+*.key
+*.pem
+
+# ---- Python ----
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
-*.egg-info/
-dist/
-build/
+.Python
+.pytest_cache/
+.mypy_cache/
 
-# Virtualenv
+# ---- Virtualenv ----
 .venv/
 venv/
 
-# Secrets
-.env
-*.env
-
-# Local data
-*.db
-data/
-logs/
-
-# OS/editor
-.DS_Store
-.idea/
-.vscode/
-# Logs / runtime outputs
+# ---- Logs ----
 *.log
-*.txt
-*.json
-*.csv
-
-# Backups
-*.bak.*
-backups/
-
-# Local runtime state
-data/
 logs/
 
-# Ignore most json runtime/state files
-*.json
+# ---- OS / Editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
 
-# BUT keep real config tracked
-!config.json
-!render.yaml
+# ---- Runtime / temp ----
+tmp/
+cache/
 
-*.tar.gz
+# ---- System ----
+*.pid
