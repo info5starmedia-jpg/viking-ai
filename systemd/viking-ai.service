@@ -1,0 +1,20 @@
+[Unit]
+Description=Viking AI Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/viking-ai
+EnvironmentFile=/opt/viking-ai/.env
+ExecStart=/opt/viking-ai/.venv/bin/python -u /opt/viking-ai/bot.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

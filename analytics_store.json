@@ -1,0 +1,47 @@
+{
+  "api_calls": 16,
+  "errors": 3,
+  "commands_total": 16,
+  "commands": {
+    "status": 3,
+    "events": 4,
+    "news_now": 4,
+    "intel": 4,
+    "help": 2,
+    "backlinks": 2,
+    "analytics": 1,
+    "seo_targets_add": 1,
+    "video": 2,
+    "watch_artist": 1,
+    "list_watchlist": 1,
+    "venuesearch": 1,
+    "artistinfo": 1,
+    "seo_audit": 1,
+    "keywords": 1,
+    "seo_targets_list": 1,
+    "chat": {
+      "count": 1,
+      "last_used_ts": 1764127094,
+      "last_user_id": 980158574363811890,
+      "last_guild_id": 1416033225544962191
+    },
+    "tm_tomorrow": {
+      "count": 1,
+      "last_used_ts": 1764128007,
+      "last_user_id": 980158574363811890,
+      "last_guild_id": 1416033225544962191
+    }
+  },
+  "keywords": {
+    "drake": 10,
+    "Taylor Swift": 1,
+    "www.5starmediaprd.com": 1,
+    "https://dashboard.shieldproxies.com/residential": 1,
+    "Madison square garden": 1,
+    "proxy": 1
+  },
+  "latencies_ms": [],
+  "total_latency_ms": 0.0,
+  "created_at": 1763163721.5881953,
+  "updated_at": 1763344563.8090641
+}

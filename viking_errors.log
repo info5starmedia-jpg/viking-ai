@@ -1,0 +1,39 @@
+
+
+--- ERROR ---
+Traceback (most recent call last):
+  File "C:\VikingAI\bot.py", line 1263, in news_now_cmd
+    results = tavily_search(query) or []
+              ^^^^^^^^^^^^^^^^^^^^
+  File "C:\VikingAI\tavily_agent.py", line 14, in tavily_search
+    res = client.search(query=query, max_results=max_results, search_depth="basic")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\VikingAI\.venv\Lib\site-packages\tavily\tavily.py", line 139, in search
+    response_dict = self._search(query,
+                    ^^^^^^^^^^^^^^^^^^^
+  File "C:\VikingAI\.venv\Lib\site-packages\tavily\tavily.py", line 109, in _search
+    raise BadRequestError(detail)
+tavily.errors.BadRequestError: Query is too long. Max query length is 400 characters.
+
+
+--- ERROR ---
+Traceback (most recent call last):
+  File "C:\VikingAI\bot.py", line 744, in intel
+    intel_data = get_artist_intel(artist, limit_events=10, limit_news=10)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\VikingAI\viking_db.py", line 241, in get_artist_intel
+    cur.execute(
+sqlite3.OperationalError: no such column: time
+
+
+--- ERROR ---
+Traceback (most recent call last):
+  File "C:\VikingAI\bot.py", line 968, in backlinks_cmd
+    await interaction.followup.send("\n".join(lines))
+  File "C:\VikingAI\.venv\Lib\site-packages\discord\webhook\async_.py", line 1900, in send
+    data = await adapter.execute_webhook(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\VikingAI\.venv\Lib\site-packages\discord\webhook\async_.py", line 226, in request
+    raise HTTPException(response, data)
+discord.errors.HTTPException: 400 Bad Request (error code: 50035): Invalid Form Body
+In content: Must be 2000 or fewer in length.

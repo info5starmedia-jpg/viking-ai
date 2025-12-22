@@ -1,0 +1,236 @@
+# =========================
+# Viking AI — bot.py
+# PART 1 / 4
+# =========================
+
+from __future__ import annotations
+
+import os
+import logging
+import asyncio
+from typing import Optional
+
+import discord
+from discord import app_commands
+from dotenv import load_dotenv
+
+import viking_db
+import ticketmaster_agent
+import verified_fan_monitor
+
+from agents.tour_news_agent_v3 import get_tour_news
+from agents.seo_agent_v2 import run_seo_audit
+
+# Optional (only if present in your repo)
+try:
+    from agents.tour_brain_v4 import get_event_intel  # type: ignore
+except Exception:
+    get_event_intel = None  # type: ignore
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("viking_ai")
+
+load_dotenv()
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+
+VERIFIED_FAN_CHANNEL_ID = os.getenv("VERIFIED_FAN_CHANNEL_ID")  # numeric string
+
+if not DISCORD_TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN (or DISCORD_BOT_TOKEN) in .env")
+
+# Intents
+intents = discord.Intents.default()
+
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+
+def _guild_obj() -> Optional[discord.Object]:
+    if not GUILD_ID:
+        return None
+    try:
+        return discord.Object(id=int(GUILD_ID))
+    except Exception:
+        return None
+
+
+async def _safe_defer(interaction: discord.Interaction, ephemeral: bool = True):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+    except Exception:
+        pass
+
+# =========================
+# Viking AI — bot.py
+# PART 2 / 4
+# =========================
+
+@client.event
+async def on_ready():
+    try:
+        viking_db.init_db()
+    except Exception:
+        logger.exception("DB init failed")
+
+    # Sync commands (guild-scoped if provided; else global)
+    try:
+        g = _guild_obj()
+        if g:
+            await tree.sync(guild=g)
+        else:
+            await tree.sync()
+        logger.info("Slash commands synced.")
+    except Exception:
+        logger.exception("Slash command sync failed")
+
+    logger.info(f"Logged in as {client.user}")
+
+    # Start Verified Fan polling loop if configured
+    try:
+        if VERIFIED_FAN_CHANNEL_ID:
+            cid = int(VERIFIED_FAN_CHANNEL_ID)
+            client.loop.create_task(verified_fan_monitor.poll_verified_fan_loop(client, cid))
+    except Exception:
+        logger.exception("Failed starting Verified Fan monitor")
+
+
+@tree.command(name="status", description="Health check & integrations status", guild=_guild_obj())
+async def status_cmd(interaction: discord.Interaction):
+    await _safe_defer(interaction, ephemeral=True)
+
+    lines = ["✅ Viking AI is running."]
+
+    lines.append(f"• Ticketmaster API key: {'✅' if os.getenv('TICKETMASTER_API_KEY') else '❌'}")
+    lines.append(f"• Tavily API key: {'✅' if os.getenv('TAVILY_API_KEY') else '❌'}")
+    lines.append(f"• OpenAI API key: {'✅' if os.getenv('OPENAI_API_KEY') else '❌'}")
+    lines.append(f"• Gemini API key: {'✅' if os.getenv('GEMINI_API_KEY') else '❌'}")
+
+    if VERIFIED_FAN_CHANNEL_ID:
+        lines.append(f"• Verified Fan channel: ✅ ({VERIFIED_FAN_CHANNEL_ID})")
+    else:
+        lines.append("• Verified Fan channel: ❌ (VERIFIED_FAN_CHANNEL_ID not set)")
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@tree.command(name="events", description="Search Ticketmaster events for an artist", guild=_guild_obj())
+@app_commands.describe(artist="Artist name (e.g., Martin Garrix)")
+async def events_cmd(interaction: discord.Interaction, artist: str):
+    await _safe_defer(interaction, ephemeral=True)
+    artist = (artist or "").strip()
+    if not artist:
+        return await interaction.followup.send("❌ Missing artist.", ephemeral=True)
+
+    try:
+        events = ticketmaster_agent.search_events_for_artist(artist, size=10)
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Ticketmaster error: {e}", ephemeral=True)
+
+    if not events:
+        return await interaction.followup.send(f"No events found for **{artist}**.", ephemeral=True)
+
+    lines = [f"🎟 **Ticketmaster Events — {artist}**"]
+    for ev in events[:10]:
+        lines.append(
+            f"• **{ev.get('name','—')}** — {ev.get('date','—')} {ev.get('time','')} "
+            f"@ {ev.get('venue','—')} ({ev.get('city','—')})\n  ID: `{ev.get('id','')}`"
+        )
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+# =========================
+# Viking AI — bot.py
+# PART 3 / 4
+# =========================
+
+@tree.command(name="eventdetails", description="Get Ticketmaster event details by event ID", guild=_guild_obj())
+@app_commands.describe(event_id="Ticketmaster event id")
+async def eventdetails_cmd(interaction: discord.Interaction, event_id: str):
+    await _safe_defer(interaction, ephemeral=True)
+
+    eid = (event_id or "").strip()
+    if not eid:
+        return await interaction.followup.send("❌ Missing event id.", ephemeral=True)
+
+    try:
+        d = ticketmaster_agent.get_event_details(eid)
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Ticketmaster error: {e}", ephemeral=True)
+
+    lines = [
+        f"🧾 **Event Details**",
+        f"• Name: **{d.get('name','—')}**",
+        f"• Date/Time: {d.get('date','—')} {d.get('time','')}",
+        f"• Venue: {d.get('venue','—')}",
+        f"• City/Country: {d.get('city','—')}, {d.get('country','—')}",
+        f"• Segment/Genre: {d.get('segment','—')} / {d.get('genre','—')}",
+        f"• URL: {d.get('url','—')}",
+    ]
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@tree.command(name="news_now", description="Tour news / rumors for an artist (Tavily)", guild=_guild_obj())
+@app_commands.describe(artist="Artist name")
+async def news_now_cmd(interaction: discord.Interaction, artist: str):
+    await _safe_defer(interaction, ephemeral=True)
+    artist = (artist or "").strip()
+    if not artist:
+        return await interaction.followup.send("❌ Missing artist.", ephemeral=True)
+
+    msg = get_tour_news(artist)
+    await interaction.followup.send(msg[:1900], ephemeral=True)
+
+
+@tree.command(name="seo", description="Run a basic SEO audit for a URL", guild=_guild_obj())
+@app_commands.describe(url="Website URL (example.com or https://example.com)")
+async def seo_cmd(interaction: discord.Interaction, url: str):
+    await _safe_defer(interaction, ephemeral=True)
+    url = (url or "").strip()
+    if not url:
+        return await interaction.followup.send("❌ Missing URL.", ephemeral=True)
+
+    report = run_seo_audit(url)
+    await interaction.followup.send(report[:1900], ephemeral=True)
+
+
+@tree.command(name="intel", description="Tour intel for an artist (uses tour_brain_v4 if available)", guild=_guild_obj())
+@app_commands.describe(artist="Artist name")
+async def intel_cmd(interaction: discord.Interaction, artist: str):
+    await _safe_defer(interaction, ephemeral=True)
+    artist = (artist or "").strip()
+    if not artist:
+        return await interaction.followup.send("❌ Missing artist.", ephemeral=True)
+
+    if not get_event_intel:
+        return await interaction.followup.send(
+            "ℹ️ tour_brain_v4 not available in this build (missing agents/tour_brain_v4.py or import failed).",
+            ephemeral=True,
+        )
+
+    try:
+        txt = get_event_intel(artist)
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Intel error: {e}", ephemeral=True)
+
+    await interaction.followup.send(str(txt)[:1900], ephemeral=True)
+
+
+# =========================
+# Viking AI — bot.py
+# PART 4 / 4
+# =========================
+
+def main():
+    client.run(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
