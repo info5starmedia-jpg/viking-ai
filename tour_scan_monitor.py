@@ -234,25 +234,3 @@ def poll_tour_scan_loop(discord_client=None, channel_id: Optional[int] = None) -
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
-# --- Viking AI integration helpers (safe) ---
-def start_background_thread(discord_client=None, channel_id: int = 0) -> None:
-    """
-    Compatibility wrapper expected by bot.py.
-    Calls any existing start/run function if present, otherwise logs and exits.
-    """
-    logger = logging.getLogger("tour_scan_monitor")
-
-    # Avoid import-time crashes if optional deps missing
-    if "requests" in globals() and globals().get("requests", None) is None:
-        logger.warning("tour_scan_monitor disabled: requests not installed")
-        return
-
-    for fn_name in ("start", "run", "start_polling_loop"):
-        fn = globals().get(fn_name)
-        if callable(fn):
-            try:
-                return fn(discord_client, channel_id)
-            except TypeError:
-                return fn()
-
-    logger.info("tour_scan_monitor present but no runnable entrypoint found")

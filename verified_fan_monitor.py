@@ -226,29 +226,3 @@ async def poll_verified_fan_loop(*_args, **kwargs) -> None:
 def stop_verified_fan_loop() -> None:
     _VF_STOP.set()
 
-# --- Viking AI integration helpers (safe) ---
-def start_polling_loop(discord_client=None, channel_id: int = 0) -> None:
-    """
-    Compatibility wrapper expected by bot.py.
-    If this module already has its own loop/thread starter, call it here.
-    If dependencies are missing, disable gracefully.
-    """
-    if requests is None:
-        logging.getLogger("verified_fan_monitor").warning(
-            "verified_fan_monitor disabled: requests not installed"
-        )
-        return
-
-    # Try to call existing entrypoints if present
-    for fn_name in ("start_background_thread", "start", "run"):
-        fn = globals().get(fn_name)
-        if callable(fn):
-            try:
-                return fn(discord_client, channel_id)
-            except TypeError:
-                # Some implementations may not accept both args
-                return fn()
-
-    logging.getLogger("verified_fan_monitor").info(
-        "verified_fan_monitor present but no runnable entrypoint found"
-    )
