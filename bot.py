@@ -1,6 +1,3 @@
-sudo systemctl stop viking-ai
-
-cat > /opt/viking-ai/bot.py <<'PY'
 import os
 import asyncio
 import logging
@@ -279,6 +276,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
-
-python3 -m py_compile /opt/viking-ai/bot.py && echo "✅ bot.py OK"
