@@ -234,3 +234,36 @@ def poll_tour_scan_loop(discord_client=None, channel_id: Optional[int] = None) -
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
+
+# --- Entry points expected by bot.py ---
+_THREAD = None
+_STOP_EVENT = None
+
+def start_background_thread(discord_client=None, channel_id: int = 0) -> None:
+    """
+    Start the tour scan polling loop in a daemon thread.
+    bot.py calls this function.
+    """
+    import threading
+    import logging
+
+    global _THREAD
+    logger = logging.getLogger("tour_scan_monitor")
+
+    if _THREAD and _THREAD.is_alive():
+        logger.info("tour_scan_monitor: already running")
+        return
+
+    if not channel_id and not (os.getenv("TOUR_SCAN_WEBHOOK_URL") or "").strip():
+        logger.info("tour_scan_monitor: no channel_id or TOUR_SCAN_WEBHOOK_URL configured; not starting")
+        return
+
+    def _runner():
+        try:
+            poll_tour_scan_loop(discord_client=discord_client, channel_id=channel_id)
+        except Exception:
+            logger.exception("tour_scan_monitor: poll loop crashed")
+
+    _THREAD = threading.Thread(target=_runner, name="tour_scan_monitor", daemon=True)
+    _THREAD.start()
+    logger.info("tour_scan_monitor: background thread started")

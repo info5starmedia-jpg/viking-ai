@@ -226,3 +226,35 @@ async def poll_verified_fan_loop(*_args, **kwargs) -> None:
 def stop_verified_fan_loop() -> None:
     _VF_STOP.set()
 
+
+# --- Entry points expected by bot.py ---
+_VF_THREAD = None
+
+def start_polling_loop(discord_client=None, channel_id: int = 0) -> None:
+    """
+    Start Verified Fan polling in a background thread.
+    bot.py calls this function.
+    """
+    import threading
+    import logging
+
+    logger = logging.getLogger("verified_fan_monitor")
+
+    global _VF_THREAD
+    if _VF_THREAD and _VF_THREAD.is_alive():
+        logger.info("verified_fan_monitor: already running")
+        return
+
+    if not channel_id:
+        logger.info("verified_fan_monitor: channel_id not set; not starting")
+        return
+
+    def _runner():
+        try:
+            poll_verified_fan_loop(discord_client=discord_client, channel_id=channel_id)
+        except Exception:
+            logger.exception("verified_fan_monitor: poll loop crashed")
+
+    _VF_THREAD = threading.Thread(target=_runner, name="verified_fan_monitor", daemon=True)
+    _VF_THREAD.start()
+    logger.info("verified_fan_monitor: polling thread started")
