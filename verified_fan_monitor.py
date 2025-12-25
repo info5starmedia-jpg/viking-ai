@@ -251,7 +251,7 @@ def start_polling_loop(discord_client=None, channel_id: int = 0) -> None:
 
     def _runner():
         try:
-            poll_verified_fan_loop(discord_client=discord_client, channel_id=channel_id)
+            asyncio.run(poll_verified_fan_loop(discord_client=discord_client, channel_id=channel_id))
         except Exception:
             logger.exception("verified_fan_monitor: poll loop crashed")
 
