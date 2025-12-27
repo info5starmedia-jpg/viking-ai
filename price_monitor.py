@@ -17,6 +17,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
+PRICE_PREFIX = (os.getenv("PRICE_PREFIX") or "[PRICE]").strip()
 logger = logging.getLogger("price_monitor")
 
 __all__ = [

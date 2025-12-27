@@ -7,6 +7,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
+VERIFIED_FAN_PREFIX = (os.getenv("VERIFIED_FAN_PREFIX") or "[VF]").strip()
 try:
     import requests  # type: ignore
 except Exception:
