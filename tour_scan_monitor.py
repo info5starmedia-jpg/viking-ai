@@ -11,6 +11,7 @@ Enhancement:
 How it posts:
   - If `discord_client` and `channel_id` provided: posts in Discord.
   - Else if `TOUR_SCAN_WEBHOOK_URL` is set: posts to the webhook.
+TOUR_SCAN_PREFIX = (os.getenv("TOUR_SCAN_PREFIX") or "[TOUR]").strip()
 
 Notes:
   - Everything is best-effort and failure-safe (no crash loops).
@@ -140,7 +141,7 @@ def post_webhook(msg: str) -> None:
         logger.info("TOUR_SCAN_WEBHOOK_URL not set, skipping webhook post")
         return
     try:
-        requests.post(TOUR_SCAN_WEBHOOK_URL, json={"content": msg}, timeout=15).raise_for_status()
+        requests.post(TOUR_SCAN_WEBHOOK_URL, json={"content": (msg if (not TOUR_SCAN_PREFIX or msg.strip().startswith(TOUR_SCAN_PREFIX)) else f"{TOUR_SCAN_PREFIX} {msg}")}, timeout=15).raise_for_status()
     except Exception as e:
         logger.warning("Webhook post failed: %s", e)
 
