@@ -1,30 +1,50 @@
 import os
 import asyncio
+import json
 import logging
-import inspect
-from typing import Optional
+import subprocess
+import time
+from typing import Any, Dict, Optional
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
 # --------------------
+# Load env (absolute path so systemd WorkingDirectory doesn't matter)
+# --------------------
+load_dotenv("/opt/viking-ai/.env", override=False)
+
+# --------------------
+# Logging
+# --------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("viking_ai")
+
+# --------------------
 # Optional imports (guarded)
 # --------------------
 try:
     import price_monitor
-except Exception:
+except Exception as e:
     price_monitor = None
+    logger.warning("price_monitor import failed: %s", e)
 
 try:
     import verified_fan_monitor
-except Exception:
+except Exception as e:
     verified_fan_monitor = None
+    logger.warning("verified_fan_monitor import failed: %s", e)
 
 try:
     import tour_scan_monitor
-except Exception:
+except Exception as e:
     tour_scan_monitor = None
+    logger.warning("tour_scan_monitor import failed: %s", e)
 
 try:
     from ticketmaster_agent_v2 import search_events_for_artist, get_event_details
@@ -37,45 +57,68 @@ try:
 except Exception:
     get_tour_news = None
 
-try:
-    from agents.seo_agent_v2 import run_seo_audit
-except Exception:
-    run_seo_audit = None
+# --------------------
+# Config
+# --------------------
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
+PRICE_ALERT_CHANNEL_ID = int(os.getenv("PRICE_ALERT_CHANNEL_ID", "0") or "0")
+VERIFIED_FAN_ALERT_CHANNEL_ID = int(os.getenv("VERIFIED_FAN_ALERT_CHANNEL_ID", "0") or "0")
+TOUR_SCAN_ALERT_CHANNEL_ID = int(os.getenv("TOUR_SCAN_ALERT_CHANNEL_ID", "0") or "0")
 
-def _env_int(name: str, default: int = 0) -> int:
+VERIFIED_FAN_WEBHOOK_URL = os.getenv("VERIFIED_FAN_WEBHOOK_URL", "").strip()
+TOUR_SCAN_WEBHOOK_URL = os.getenv("TOUR_SCAN_WEBHOOK_URL", "").strip()
+
+VERIFIED_FAN_POLL_SECONDS = int(os.getenv("VERIFIED_FAN_POLL_SECONDS", "7200") or "7200")
+
+# Prefixes (for a mixed channel)
+PRICE_PREFIX = (os.getenv("PRICE_PREFIX") or "[PRICE]").strip()
+VERIFIED_FAN_PREFIX = (os.getenv("VERIFIED_FAN_PREFIX") or "[VF]").strip()
+TOUR_SCAN_PREFIX = (os.getenv("TOUR_SCAN_PREFIX") or "[TOUR]").strip()
+
+# Health/Watchdog
+HEALTH_PING_SECONDS = int(os.getenv("HEALTH_PING_SECONDS", "60") or "60")
+STARTUP_NOTIFY = (os.getenv("STARTUP_NOTIFY", "1") or "1").strip().lower() not in ("0", "false", "no")
+
+START_TS = time.time()
+STATUS: Dict[str, Any] = {
+    "started_at_unix": START_TS,
+    "last_price_post_unix": None,
+    "last_vf_post_unix": None,
+    "last_tour_post_unix": None,
+    "last_error": None,
+}
+
+def _uptime_seconds() -> int:
+    return int(time.time() - START_TS)
+
+def _memory_mb() -> float:
+    # Works on Linux without extra deps
     try:
-        v = (os.getenv(name) or "").strip()
-        return int(v) if v else default
+        with open("/proc/self/statm", "r") as f:
+            pages = int(f.read().split()[0])
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return (pages * page_size) / (1024 * 1024)
     except Exception:
-        return default
+        return -1.0
 
+def _git_rev() -> str:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd="/opt/viking-ai",
+            stderr=subprocess.DEVNULL,
+        )
+        return out.decode().strip()
+    except Exception:
+        return "unknown"
 
-def _env_str(name: str, default: str = "") -> str:
-    return (os.getenv(name) or default).strip()
-
-
-# --------------------
-# Env + logging
-# --------------------
-load_dotenv()
-
-DISCORD_TOKEN = _env_str("DISCORD_TOKEN") or _env_str("DISCORD_BOT_TOKEN")
-if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN (or DISCORD_BOT_TOKEN) missing in /opt/viking-ai/.env")
-
-PRICE_ALERT_CHANNEL_ID = _env_int("PRICE_ALERT_CHANNEL_ID", 0)
-VERIFIED_FAN_ALERT_CHANNEL_ID = _env_int("VERIFIED_FAN_ALERT_CHANNEL_ID", 0)
-TOUR_SCAN_ALERT_CHANNEL_ID = _env_int("TOUR_SCAN_ALERT_CHANNEL_ID", 0)
-TOUR_SCAN_WEBHOOK_URL = _env_str("TOUR_SCAN_WEBHOOK_URL", "")
-PRICE_POLL_SECONDS = _env_int("PRICE_POLL_SECONDS", 900)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("viking_ai")
-
+def _redact(s: str, keep: int = 6) -> str:
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "…" * len(s)
+    return s[:keep] + "…" * 6
 
 # --------------------
 # Discord client
@@ -84,194 +127,373 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-_started_background = False
+# Keep references to background tasks to prevent GC
+_bg_tasks: Dict[str, asyncio.Task] = {}
 
-
-# --------------------
-# Commands
-# --------------------
-@tree.command(name="status", description="System health check")
-async def status_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    bits = []
-    bits.append(f"✅ Bot online: **{client.user}**" if client.user else "✅ Bot online")
-    bits.append(f"PRICE_ALERT_CHANNEL_ID: `{PRICE_ALERT_CHANNEL_ID}`")
-    bits.append(f"VERIFIED_FAN_ALERT_CHANNEL_ID: `{VERIFIED_FAN_ALERT_CHANNEL_ID}`")
-    bits.append(f"TOUR_SCAN_ALERT_CHANNEL_ID: `{TOUR_SCAN_ALERT_CHANNEL_ID}`")
-    bits.append(f"TOUR_SCAN_WEBHOOK_URL set: `{'YES' if bool(TOUR_SCAN_WEBHOOK_URL) else 'NO'}`")
-    bits.append(f"price_monitor import: `{'OK' if price_monitor else 'MISSING'}`")
-    bits.append(f"verified_fan_monitor import: `{'OK' if verified_fan_monitor else 'MISSING'}`")
-    bits.append(f"tour_scan_monitor import: `{'OK' if tour_scan_monitor else 'MISSING'}`")
-    await interaction.followup.send("\n".join(bits), ephemeral=True)
-
-
-@tree.command(name="events", description="Search Ticketmaster events for an artist")
-@app_commands.describe(artist="Artist name, e.g. Tyler Childers")
-async def events_cmd(interaction: discord.Interaction, artist: str):
-    await interaction.response.defer()
-    if not search_events_for_artist:
-        await interaction.followup.send("❌ Ticketmaster agent not available (ticketmaster_agent_v2 import failed).")
-        return
-
-    try:
-        events = search_events_for_artist(artist)
-        if not events:
-            await interaction.followup.send(f"No events found for **{artist}**.")
-            return
-
-        out = [f"**Events for {artist}:**"]
-        for e in events[:10]:
-            name = e.get("name") or "Unknown"
-            eid = e.get("id") or "N/A"
-            date = (e.get("dates") or {}).get("start", {}).get("localDate") or ""
-            venue = (((e.get("_embedded") or {}).get("venues") or [{}])[0]).get("name") or ""
-            out.append(f"- `{eid}` — **{name}** — {date} — {venue}".strip())
-
-        if len(events) > 10:
-            out.append(f"...and {len(events) - 10} more.")
-        await interaction.followup.send("\n".join(out))
-    except Exception:
-        logger.exception("events_cmd failed")
-        await interaction.followup.send("❌ Error searching events (check logs).")
-
-
-@tree.command(name="eventdetails", description="Get Ticketmaster event details by id")
-@app_commands.describe(event_id="Ticketmaster event id")
-async def eventdetails_cmd(interaction: discord.Interaction, event_id: str):
-    await interaction.response.defer()
-    if not get_event_details:
-        await interaction.followup.send("❌ Ticketmaster agent not available (ticketmaster_agent_v2 import failed).")
-        return
-    try:
-        e = get_event_details(event_id)
-        if not e:
-            await interaction.followup.send("No details returned.")
-            return
-        name = e.get("name") or "Unknown"
-        date = (e.get("dates") or {}).get("start", {}).get("localDate") or ""
-        venue = (((e.get("_embedded") or {}).get("venues") or [{}])[0]).get("name") or ""
-        url = e.get("url") or ""
-        await interaction.followup.send(f"**{name}**\nDate: {date}\nVenue: {venue}\n{url}".strip())
-    except Exception:
-        logger.exception("eventdetails_cmd failed")
-        await interaction.followup.send("❌ Error fetching event details (check logs).")
-
-
-# --------------------
-# Monitors
-# --------------------
-async def _start_price_monitor():
-    if not PRICE_ALERT_CHANNEL_ID:
-        logger.info("Price monitor disabled (PRICE_ALERT_CHANNEL_ID not set).")
-        return
-    if not price_monitor:
-        logger.warning("Price monitor disabled (price_monitor import failed).")
-        return
-
-    async def _post_price_alert(alert: dict) -> None:
+async def _get_channel(channel_id: int) -> Optional[discord.abc.Messageable]:
+    if not channel_id:
+        return None
+    ch = client.get_channel(channel_id)
+    if ch is None:
         try:
-            channel = client.get_channel(PRICE_ALERT_CHANNEL_ID) or await client.fetch_channel(PRICE_ALERT_CHANNEL_ID)
-            title = alert.get("title") or "Price Alert"
-            body = alert.get("message") or alert.get("text") or str(alert)
-            await channel.send(f"**{title}**\n{body}")
+            ch = await client.fetch_channel(channel_id)
         except Exception:
-            logger.exception("Failed posting price alert to Discord")
+            return None
+    return ch
 
-    async def _price_loop():
-        logger.info("Price monitor loop started (%ss interval).", PRICE_POLL_SECONDS)
-        while True:
+async def _send_webhook(webhook_url: str, content: str, embeds: Optional[list] = None) -> None:
+    if not webhook_url:
+        return
+    try:
+        wh = discord.SyncWebhook.from_url(webhook_url)
+        await asyncio.to_thread(wh.send, content=content, embeds=embeds or None, wait=False)
+    except Exception as e:
+        logger.warning("Webhook send failed: %s", e)
+
+async def _send_to_mixed_channel(content: str, prefer: str = "tour") -> None:
+    """
+    Prefer sending to an existing configured webhook (TOUR/VF) because those work even if the bot lacks send perms.
+    Fallback to a Discord channel send.
+    """
+    if prefer == "tour" and TOUR_SCAN_WEBHOOK_URL:
+        await _send_webhook(TOUR_SCAN_WEBHOOK_URL, content)
+        return
+    if prefer == "vf" and VERIFIED_FAN_WEBHOOK_URL:
+        await _send_webhook(VERIFIED_FAN_WEBHOOK_URL, content)
+        return
+    if TOUR_SCAN_WEBHOOK_URL:
+        await _send_webhook(TOUR_SCAN_WEBHOOK_URL, content)
+        return
+    if VERIFIED_FAN_WEBHOOK_URL:
+        await _send_webhook(VERIFIED_FAN_WEBHOOK_URL, content)
+        return
+
+    ch = await _get_channel(PRICE_ALERT_CHANNEL_ID or VERIFIED_FAN_ALERT_CHANNEL_ID or TOUR_SCAN_ALERT_CHANNEL_ID)
+    if ch:
+        try:
+            await ch.send(content)
+        except Exception as e:
+            logger.warning("Channel send failed: %s", e)
+
+def _task_guard(name: str, task: asyncio.Task) -> None:
+    def _done(t: asyncio.Task) -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            STATUS["last_error"] = f"{name}: {e}"
+            return
+        if exc:
+            STATUS["last_error"] = f"{name}: {exc}"
+            logger.exception("Background task crashed: %s", name, exc_info=exc)
+            asyncio.create_task(_send_to_mixed_channel(f"⚠️ {name} crashed: `{exc}`", prefer="tour"))
+
+    task.add_done_callback(_done)
+    _bg_tasks[name] = task
+
+# --------------------
+# Posting helpers (PRICE / VF)
+# --------------------
+async def post_price_alert(item: Dict[str, Any]) -> None:
+    STATUS["last_price_post_unix"] = time.time()
+    prefix = PRICE_PREFIX or "[PRICE]"
+    try:
+        artist = item.get("artist") or "Unknown Artist"
+        event = item.get("event") or ""
+        url = item.get("url") or ""
+        source = item.get("source") or "secondary"
+        low = item.get("low_price")
+        high = item.get("high_price")
+        baseline = item.get("baseline_price")
+        pct = item.get("pct_change")
+        updated = item.get("as_of") or ""
+
+        title = f"{prefix} Price change detected"
+        desc_parts = []
+        if event:
+            desc_parts.append(f"**Event:** {event}")
+        desc_parts.append(f"**Artist:** {artist}")
+        desc_parts.append(f"**Source:** {source}")
+        if updated:
+            desc_parts.append(f"**As of:** {updated}")
+
+        embed = discord.Embed(description="\n".join(desc_parts))
+        embed.set_footer(text="Viking AI • price monitor")
+
+        def money(v: Any) -> str:
             try:
-                alerts = price_monitor.poll_prices_once()
-                if alerts:
-                    if isinstance(alerts, dict):
-                        alerts = [alerts]
-                    for alert in alerts:
-                        await _post_price_alert(alert)
+                return f"${float(v):,.2f}"
             except Exception:
-                logger.exception("price monitor loop failed")
-            await asyncio.sleep(PRICE_POLL_SECONDS)
+                return "—"
 
-    asyncio.create_task(_price_loop())
+        if low is not None:
+            embed.add_field(name="Low", value=money(low), inline=True)
+        if high is not None:
+            embed.add_field(name="High", value=money(high), inline=True)
+        if baseline is not None:
+            embed.add_field(name="Baseline", value=money(baseline), inline=True)
+        if pct is not None:
+            try:
+                embed.add_field(name="% Change", value=f"{float(pct):+.2f}%", inline=True)
+            except Exception:
+                pass
+        if url:
+            embed.add_field(name="Link", value=url, inline=False)
 
+        ch = await _get_channel(PRICE_ALERT_CHANNEL_ID) if PRICE_ALERT_CHANNEL_ID else None
+        if ch:
+            await ch.send(content=title, embed=embed)
+        else:
+            await _send_to_mixed_channel(title, prefer="tour")
+            if TOUR_SCAN_WEBHOOK_URL:
+                await _send_webhook(TOUR_SCAN_WEBHOOK_URL, content="", embeds=[embed])
+            elif VERIFIED_FAN_WEBHOOK_URL:
+                await _send_webhook(VERIFIED_FAN_WEBHOOK_URL, content="", embeds=[embed])
+    except Exception as e:
+        logger.warning("post_price_alert failed: %s", e)
 
-async def _start_verified_fan_monitor():
-    if not verified_fan_monitor:
-        logger.info("Verified fan disabled (verified_fan_monitor import failed).")
+async def post_verified_fan_item(item: Dict[str, Any]) -> None:
+    STATUS["last_vf_post_unix"] = time.time()
+    prefix = VERIFIED_FAN_PREFIX or "[VF]"
+    title = (item.get("title") or "Verified Fan update").strip()
+    url = (item.get("url") or "").strip()
+    when = (item.get("published") or item.get("date") or "").strip()
+    src = (item.get("source") or "").strip()
+
+    msg = f"{prefix} {title}"
+    if when:
+        msg += f"\n🕒 {when}"
+    if src:
+        msg += f"\n📰 {src}"
+    if url:
+        msg += f"\n{url}"
+
+    if VERIFIED_FAN_WEBHOOK_URL:
+        await _send_webhook(VERIFIED_FAN_WEBHOOK_URL, msg)
+    else:
+        ch = await _get_channel(VERIFIED_FAN_ALERT_CHANNEL_ID)
+        if ch:
+            await ch.send(msg)
+        else:
+            await _send_to_mixed_channel(msg, prefer="vf")
+
+# --------------------
+# Background loops
+# --------------------
+async def price_monitor_loop(interval_seconds: int = 900) -> None:
+    if price_monitor is None:
+        logger.info("price_monitor not available; skipping.")
         return
-    if not VERIFIED_FAN_ALERT_CHANNEL_ID:
-        logger.info("Verified fan disabled (VERIFIED_FAN_ALERT_CHANNEL_ID not set).")
+    logger.info("Price monitor loop started (%ss interval).", interval_seconds)
+    while True:
+        try:
+            if hasattr(price_monitor, "poll_prices_once"):
+                await asyncio.to_thread(price_monitor.poll_prices_once, post_price_alert)
+            elif hasattr(price_monitor, "poll_once"):
+                await asyncio.to_thread(price_monitor.poll_once, post_price_alert)
+        except Exception as e:
+            STATUS["last_error"] = f"price_monitor_loop: {e}"
+            logger.warning("Price monitor tick failed: %s", e)
+        await asyncio.sleep(interval_seconds)
+
+async def verified_fan_loop() -> None:
+    if verified_fan_monitor is None:
+        logger.info("verified_fan_monitor not available; skipping.")
+        return
+    logger.info("Verified fan polling loop started (async task).")
+    if hasattr(verified_fan_monitor, "start_verified_fan_loop"):
+        await asyncio.to_thread(verified_fan_monitor.start_verified_fan_loop, post_verified_fan_item, VERIFIED_FAN_POLL_SECONDS)
+    elif hasattr(verified_fan_monitor, "start_background_thread"):
+        await asyncio.to_thread(verified_fan_monitor.start_background_thread, post_verified_fan_item, VERIFIED_FAN_POLL_SECONDS)
+    else:
+        if hasattr(verified_fan_monitor, "_poll_loop"):
+            await asyncio.to_thread(verified_fan_monitor._poll_loop, post_verified_fan_item, VERIFIED_FAN_POLL_SECONDS)
+
+async def health_watchdog() -> None:
+    if STARTUP_NOTIFY:
+        await _send_to_mixed_channel(
+            f"✅ Viking AI online • rev `{_git_rev()}` • PID `{os.getpid()}`",
+            prefer="tour",
+        )
+    while True:
+        try:
+            if HEALTH_PING_SECONDS > 0:
+                logger.debug("health tick uptime=%ss mem=%.1fMB", _uptime_seconds(), _memory_mb())
+        except Exception as e:
+            STATUS["last_error"] = f"health_watchdog: {e}"
+        await asyncio.sleep(max(HEALTH_PING_SECONDS, 30))
+
+def start_tour_scan_monitor() -> None:
+    if tour_scan_monitor is None:
+        logger.info("tour_scan_monitor not available; skipping.")
         return
 
-    coro = getattr(verified_fan_monitor, "poll_verified_fan_loop", None)
-    if callable(coro):
-        asyncio.create_task(coro(discord_client=client, channel_id=VERIFIED_FAN_ALERT_CHANNEL_ID))
-        logger.info("Verified fan polling loop started (async task).")
-        return
-
-    starter = getattr(verified_fan_monitor, "start_verified_fan_monitor", None)
-    if callable(starter):
-        starter(discord_client=client, channel_id=VERIFIED_FAN_ALERT_CHANNEL_ID)
-        logger.info("Verified fan polling loop started (thread).")
-        return
-
-    logger.info("verified_fan_monitor present but no recognized starter found; skipping.")
-
-
-def _start_tour_scan_monitor() -> None:
-    if not tour_scan_monitor:
-        logger.info("Tour scan disabled (tour_scan_monitor import failed).")
-        return
-
-    # Prefer start_background_thread()
-    starter = getattr(tour_scan_monitor, "start_background_thread", None)
-    if not callable(starter):
-        starter = getattr(tour_scan_monitor, "start_tour_scan_monitor", None)
-
-    if not callable(starter):
+    starter = getattr(tour_scan_monitor, "start_background_thread", None) or getattr(tour_scan_monitor, "start_tour_scan_monitor", None)
+    if not starter:
         logger.info("tour_scan_monitor present but no start_background_thread()/start_tour_scan_monitor() found; skipping.")
         return
 
-    kwargs = {}
     try:
-        sig = inspect.signature(starter)
-        params = set(sig.parameters.keys())
+        starter(
+            discord_client=client,
+            channel_id=TOUR_SCAN_ALERT_CHANNEL_ID,
+            webhook_url=TOUR_SCAN_WEBHOOK_URL,
+        )
+        logger.info("Tour scan background thread started.")
+    except TypeError:
+        starter({"discord_client": client, "channel_id": TOUR_SCAN_ALERT_CHANNEL_ID, "webhook_url": TOUR_SCAN_WEBHOOK_URL})
+        logger.info("Tour scan background thread started.")
+    except Exception as e:
+        STATUS["last_error"] = f"tour_scan_monitor start: {e}"
+        logger.warning("Failed to start tour_scan_monitor: %s", e)
 
-        if "discord_client" in params:
-            kwargs["discord_client"] = client
-        if "channel_id" in params:
-            kwargs["channel_id"] = TOUR_SCAN_ALERT_CHANNEL_ID
-        if "webhook_url" in params:
-            kwargs["webhook_url"] = TOUR_SCAN_WEBHOOK_URL
-    except Exception:
-        kwargs = {"discord_client": client, "channel_id": TOUR_SCAN_ALERT_CHANNEL_ID, "webhook_url": TOUR_SCAN_WEBHOOK_URL}
+# --------------------
+# Slash Commands
+# --------------------
+@tree.command(name="status", description="Show bot status (uptime, memory, monitors).")
+async def status_cmd(interaction: discord.Interaction):
+    data = {
+        "rev": _git_rev(),
+        "uptime_seconds": _uptime_seconds(),
+        "memory_mb": round(_memory_mb(), 1),
+        "monitors": {
+            "price_monitor": bool(price_monitor),
+            "verified_fan_monitor": bool(verified_fan_monitor),
+            "tour_scan_monitor": bool(tour_scan_monitor),
+        },
+        "last_posts": {
+            "price": STATUS.get("last_price_post_unix"),
+            "vf": STATUS.get("last_vf_post_unix"),
+            "tour": STATUS.get("last_tour_post_unix"),
+        },
+        "last_error": STATUS.get("last_error"),
+    }
+    await interaction.response.send_message(f"```json\n{json.dumps(data, indent=2, default=str)}\n```", ephemeral=True)
 
-    starter(**kwargs)
-    logger.info("Tour scan background thread started.")
+@tree.command(name="health", description="Health JSON dump (config presence + task state).")
+async def health_cmd(interaction: discord.Interaction):
+    def task_state(t: Optional[asyncio.Task]) -> Dict[str, Any]:
+        if not t:
+            return {"present": False}
+        return {"present": True, "done": t.done(), "cancelled": t.cancelled(), "name": t.get_name()}
 
+    health = {
+        "rev": _git_rev(),
+        "pid": os.getpid(),
+        "uptime_seconds": _uptime_seconds(),
+        "memory_mb": round(_memory_mb(), 1),
+        "env": {
+            "DISCORD_TOKEN_set": bool(DISCORD_TOKEN),
+            "PRICE_ALERT_CHANNEL_ID": PRICE_ALERT_CHANNEL_ID,
+            "VERIFIED_FAN_ALERT_CHANNEL_ID": VERIFIED_FAN_ALERT_CHANNEL_ID,
+            "TOUR_SCAN_ALERT_CHANNEL_ID": TOUR_SCAN_ALERT_CHANNEL_ID,
+            "VERIFIED_FAN_WEBHOOK_URL_set": bool(VERIFIED_FAN_WEBHOOK_URL),
+            "TOUR_SCAN_WEBHOOK_URL_set": bool(TOUR_SCAN_WEBHOOK_URL),
+            "PRICE_PREFIX": PRICE_PREFIX,
+            "VERIFIED_FAN_PREFIX": VERIFIED_FAN_PREFIX,
+            "TOUR_SCAN_PREFIX": TOUR_SCAN_PREFIX,
+        },
+        "tasks": {k: task_state(v) for k, v in _bg_tasks.items()},
+        "last_error": STATUS.get("last_error"),
+    }
+    await interaction.response.send_message(f"```json\n{json.dumps(health, indent=2, default=str)}\n```", ephemeral=True)
 
+@tree.command(name="debug", description="Quick debug dump (non-sensitive).")
+async def debug_cmd(interaction: discord.Interaction):
+    msg = (
+        f"rev `{_git_rev()}` | uptime `{_uptime_seconds()}s` | mem `{_memory_mb():.1f}MB`\n"
+        f"IDs: price={PRICE_ALERT_CHANNEL_ID} vf={VERIFIED_FAN_ALERT_CHANNEL_ID} tour={TOUR_SCAN_ALERT_CHANNEL_ID}\n"
+        f"Webhooks: vf={bool(VERIFIED_FAN_WEBHOOK_URL)} tour={bool(TOUR_SCAN_WEBHOOK_URL)}\n"
+        f"Prefixes: {PRICE_PREFIX} {VERIFIED_FAN_PREFIX} {TOUR_SCAN_PREFIX}\n"
+        f"Token: {_redact(DISCORD_TOKEN)}"
+    )
+    await interaction.response.send_message(msg, ephemeral=True)
+
+@tree.command(name="news_now", description="Get latest tour news for an artist.")
+@app_commands.describe(artist="Artist name")
+async def news_now_cmd(interaction: discord.Interaction, artist: str):
+    await interaction.response.defer(thinking=True)
+    if not get_tour_news:
+        await interaction.followup.send("Tour news agent not available.")
+        return
+    try:
+        text = await asyncio.to_thread(get_tour_news, artist)
+        await interaction.followup.send(text[:1900])
+    except Exception as e:
+        await interaction.followup.send(f"Error: {e}")
+
+@tree.command(name="events", description="Search Ticketmaster events for an artist.")
+@app_commands.describe(artist="Artist name")
+async def events_cmd(interaction: discord.Interaction, artist: str):
+    await interaction.response.defer(thinking=True)
+    if not search_events_for_artist:
+        await interaction.followup.send("Ticketmaster search not available.")
+        return
+    try:
+        results = await asyncio.to_thread(search_events_for_artist, artist)
+        if not results:
+            await interaction.followup.send("No events found.")
+            return
+        lines = []
+        for e in results[:10]:
+            eid = e.get("id") or e.get("event_id") or "?"
+            name = e.get("name") or e.get("title") or "Event"
+            date = e.get("date") or e.get("localDate") or ""
+            venue = e.get("venue") or ""
+            lines.append(f"• `{eid}` — {name} ({date}) {venue}".strip())
+        await interaction.followup.send("\n".join(lines)[:1900])
+    except Exception as e:
+        await interaction.followup.send(f"Error: {e}")
+
+@tree.command(name="eventdetails", description="Get Ticketmaster event details by id.")
+@app_commands.describe(event_id="Ticketmaster event id")
+async def eventdetails_cmd(interaction: discord.Interaction, event_id: str):
+    await interaction.response.defer(thinking=True)
+    if not get_event_details:
+        await interaction.followup.send("Ticketmaster details not available.")
+        return
+    try:
+        d = await asyncio.to_thread(get_event_details, event_id)
+        if not d:
+            await interaction.followup.send("No details found.")
+            return
+        await interaction.followup.send(f"```json\n{json.dumps(d, indent=2, default=str)[:1900]}\n```")
+    except Exception as e:
+        await interaction.followup.send(f"Error: {e}")
+
+# --------------------
+# Lifecycle
+# --------------------
 @client.event
 async def on_ready():
-    global _started_background
-    if _started_background:
-        return
-    _started_background = True
-
     try:
         await tree.sync()
         logger.info("Slash commands synced.")
-    except Exception:
-        logger.exception("Slash commands sync failed")
+    except Exception as e:
+        logger.warning("Slash sync failed: %s", e)
 
     logger.info("Logged in as %s", client.user)
 
-    await _start_verified_fan_monitor()
-    _start_tour_scan_monitor()
-    await _start_price_monitor()
+    # Start monitors
+    start_tour_scan_monitor()
 
+    t1 = asyncio.create_task(verified_fan_loop(), name="verified_fan_loop")
+    _task_guard("verified_fan_loop", t1)
 
+    t2 = asyncio.create_task(price_monitor_loop(interval_seconds=900), name="price_monitor_loop")
+    _task_guard("price_monitor_loop", t2)
+
+    t3 = asyncio.create_task(health_watchdog(), name="health_watchdog")
+    _task_guard("health_watchdog", t3)
+
+# --------------------
+# Entrypoint
+# --------------------
 def main():
+    if not DISCORD_TOKEN:
+        raise SystemExit("DISCORD_TOKEN is not set.")
     client.run(DISCORD_TOKEN)
-
 
 if __name__ == "__main__":
     main()
