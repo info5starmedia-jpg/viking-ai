@@ -11,7 +11,6 @@ Enhancement:
 How it posts:
   - If `discord_client` and `channel_id` provided: posts in Discord.
   - Else if `TOUR_SCAN_WEBHOOK_URL` is set: posts to the webhook.
-TOUR_SCAN_PREFIX = (os.getenv("TOUR_SCAN_PREFIX") or "[TOUR]").strip()
 
 Notes:
   - Everything is best-effort and failure-safe (no crash loops).
