@@ -16,10 +16,8 @@ import json
 import threading
 import logging
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 
-import requests
-import feedparser
 
 logger = logging.getLogger("tour_scan")
 
@@ -35,6 +33,20 @@ _THREAD: Optional[threading.Thread] = None
 _STOP_EVENT = threading.Event()
 
 # -------------- HELPERS --------------
+def _resolve_interval_seconds(value: Any, default: int = 3600) -> int:
+    if isinstance(value, dict):
+        for key in ("interval_seconds", "seconds", "interval", "poll_seconds", "poll_interval", "value"):
+            if key in value:
+                value = value.get(key)
+                break
+        else:
+            return default
+    try:
+        interval = int(float(value))
+    except Exception:
+        return default
+    return max(1, interval)
+
 def _apply_prefix(prefix: str, msg: str) -> str:
     """Prepend prefix unless message already starts with it."""
     if not prefix:
@@ -53,6 +65,7 @@ def post_webhook(msg: str) -> None:
     content = _apply_prefix(TOUR_SCAN_PREFIX, msg)
 
     try:
+        import requests
         requests.post(
             TOUR_SCAN_WEBHOOK_URL,
             json={"content": content},
@@ -67,6 +80,7 @@ def post_webhook(msg: str) -> None:
 def fetch_rss_items(url: str) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     try:
+        import feedparser
         feed = feedparser.parse(url)
         for e in (feed.entries or []):
             items.append({
@@ -90,9 +104,13 @@ def stars_to_emoji(stars: int) -> str:
 def top_cities_for_artist(artist: str) -> List[str]:
     return []
 
-def poll_tour_scan_loop(interval_seconds: int = 3600) -> None:
+def poll_tour_scan_loop(
+    interval_seconds: int = 3600,
+    post_callback: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
+) -> None:
     """Main polling loop (runs in a background thread)."""
-    logger.info("Tour scan loop started (%s-minute interval).", int(interval_seconds/60))
+    interval_seconds = _resolve_interval_seconds(interval_seconds, 3600)
+    logger.info("Tour scan loop started (%s-minute interval).", int(interval_seconds / 60))
     # If you have RSS URLs in env, use them; otherwise keep running quietly.
     rss_urls = [u.strip() for u in (os.getenv("TOUR_SCAN_RSS_URLS") or "").split(",") if u.strip()]
     seen = set()
@@ -112,7 +130,13 @@ def poll_tour_scan_loop(interval_seconds: int = 3600) -> None:
                     seen.add(key)
 
                     msg = f"New tour item: {item.get('title','(no title)')}\n{item.get('link','')}".strip()
-                    # Tour scan monitor currently posts via webhook (your bot uses one channel for everything)
+                    if callable(post_callback):
+                        try:
+                            enriched = post_callback(item)
+                            if isinstance(enriched, str) and enriched.strip():
+                                msg = enriched.strip()
+                        except Exception:
+                            logger.exception("tour_scan_monitor: post_callback failed")
                     post_webhook(msg)
 
         except Exception as ex:
@@ -124,13 +148,23 @@ def poll_tour_scan_loop(interval_seconds: int = 3600) -> None:
                 break
             time.sleep(5)
 
-def start_background_thread(interval_seconds: int = 3600) -> None:
+def start_background_thread(
+    interval_seconds: int = 3600,
+    post_callback: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
+) -> None:
     global _THREAD
     if _THREAD and _THREAD.is_alive():
         logger.info("tour_scan_monitor: already running")
         return
     _STOP_EVENT.clear()
-    _THREAD = threading.Thread(target=poll_tour_scan_loop, kwargs={"interval_seconds": interval_seconds}, daemon=True)
+    if isinstance(interval_seconds, dict) and post_callback is None:
+        post_callback = interval_seconds.get("post_callback")
+    resolved_interval = _resolve_interval_seconds(interval_seconds, 3600)
+    _THREAD = threading.Thread(
+        target=poll_tour_scan_loop,
+        kwargs={"interval_seconds": resolved_interval, "post_callback": post_callback},
+        daemon=True,
+    )
     _THREAD.start()
     logger.info("tour_scan_monitor: background thread started")
 
