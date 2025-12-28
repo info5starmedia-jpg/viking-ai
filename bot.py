@@ -1,10 +1,15 @@
 import os
 import asyncio
+import base64
 import json
 import logging
+import math
+import re
 import subprocess
+import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
+
 
 import discord
 from discord import app_commands
@@ -47,6 +52,11 @@ except Exception as e:
     logger.warning("tour_scan_monitor import failed: %s", e)
 
 try:
+    import viking_db
+except Exception:
+    viking_db = None
+
+try:
     from ticketmaster_agent_v2 import search_events_for_artist, get_event_details
 except Exception:
     search_events_for_artist = None
@@ -71,6 +81,18 @@ TOUR_SCAN_WEBHOOK_URL = os.getenv("TOUR_SCAN_WEBHOOK_URL", "").strip()
 
 VERIFIED_FAN_POLL_SECONDS = int(os.getenv("VERIFIED_FAN_POLL_SECONDS", "7200") or "7200")
 
+# Artist intel integrations
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
+GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY", "").strip()
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "").strip()
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
+
+ARTIST_CACHE_PATH = "/opt/viking-ai/artist_profiles.json"
+URL_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+STATS_CACHE_TTL_SECONDS = 24 * 60 * 60
+
 # Prefixes (for a mixed channel)
 PRICE_PREFIX = (os.getenv("PRICE_PREFIX") or "[PRICE]").strip()
 VERIFIED_FAN_PREFIX = (os.getenv("VERIFIED_FAN_PREFIX") or "[VF]").strip()
@@ -88,6 +110,10 @@ STATUS: Dict[str, Any] = {
     "last_tour_post_unix": None,
     "last_error": None,
 }
+
+_artist_cache_lock = threading.Lock()
+_SPOTIFY_TOKEN: Optional[str] = None
+_SPOTIFY_TOKEN_EXPIRY: float = 0.0
 
 def _uptime_seconds() -> int:
     return int(time.time() - START_TS)
@@ -121,6 +147,505 @@ def _redact(s: str, keep: int = 6) -> str:
     return s[:keep] + "…" * 6
 
 # --------------------
+# Artist intel helpers
+# --------------------
+def normalize_artist_key(artist: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", (artist or "").lower()).strip()
+    return re.sub(r"\s+", " ", cleaned)
+
+def _ensure_cache_dir() -> None:
+    try:
+        os.makedirs(os.path.dirname(ARTIST_CACHE_PATH), exist_ok=True)
+    except Exception:
+        return
+
+def load_cache() -> Dict[str, Any]:
+    with _artist_cache_lock:
+        if not os.path.exists(ARTIST_CACHE_PATH):
+            return {}
+        try:
+            with open(ARTIST_CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return {}
+    return {}
+
+def save_cache(cache: Dict[str, Any]) -> None:
+    with _artist_cache_lock:
+        _ensure_cache_dir()
+        try:
+            with open(ARTIST_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=2, sort_keys=True)
+        except Exception:
+            return
+
+def _cache_get_artist(cache: Dict[str, Any], artist_key: str) -> Dict[str, Any]:
+    entry = cache.get(artist_key)
+    if isinstance(entry, dict):
+        return entry
+    return {}
+
+def _cache_set_artist(cache: Dict[str, Any], artist_key: str, data: Dict[str, Any]) -> None:
+    cache[artist_key] = data
+
+def _is_fresh(ts: Optional[float], ttl_seconds: int) -> bool:
+    if not ts:
+        return False
+    return (time.time() - float(ts)) <= ttl_seconds
+
+def _get_cached_urls(entry: Dict[str, Any]) -> Dict[str, Any]:
+    urls = entry.get("urls")
+    if isinstance(urls, dict) and _is_fresh(urls.get("updated_at"), URL_CACHE_TTL_SECONDS):
+        return urls
+    return {}
+
+def _get_cached_stats(entry: Dict[str, Any]) -> Dict[str, Any]:
+    stats = entry.get("stats")
+    if isinstance(stats, dict) and _is_fresh(stats.get("updated_at"), STATS_CACHE_TTL_SECONDS):
+        return stats
+    return {}
+
+def tavily_search(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
+    if not TAVILY_API_KEY or not query:
+        return []
+    import requests
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "search_depth": "basic",
+        "max_results": max(1, int(max_results)),
+    }
+    try:
+        resp = requests.post("https://api.tavily.com/search", json=payload, timeout=20)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        results = data.get("results") or []
+        return [r for r in results if isinstance(r, dict)]
+    except Exception:
+        return []
+
+def google_cse_search(query: str, num: int = 5) -> List[Dict[str, Any]]:
+    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_ID or not query:
+        return []
+    import requests
+    params = {
+        "key": GOOGLE_CSE_API_KEY,
+        "cx": GOOGLE_CSE_ID,
+        "q": query,
+        "num": max(1, min(10, int(num))),
+    }
+    try:
+        resp = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        items = data.get("items") or []
+        return [i for i in items if isinstance(i, dict)]
+    except Exception:
+        return []
+
+def _extract_urls(results: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    urls: List[Tuple[str, str]] = []
+    for r in results or []:
+        url = (r.get("url") or r.get("link") or "").strip()
+        title = (r.get("title") or r.get("snippet") or r.get("content") or "").strip()
+        if url:
+            urls.append((url, title))
+    return urls
+
+def _find_first_url(urls: List[Tuple[str, str]], predicate) -> Optional[str]:
+    for url, title in urls:
+        try:
+            if predicate(url, title):
+                return url
+        except Exception:
+            continue
+    return None
+
+def _is_social_domain(url: str, domain: str) -> bool:
+    return domain in url.lower()
+
+def _discover_profile_links(artist: str) -> Dict[str, Any]:
+    urls: List[Tuple[str, str]] = []
+    tavily = tavily_search(f"{artist} official site presale signup verified fan youtube spotify tiktok", max_results=6)
+    urls.extend(_extract_urls(tavily))
+
+    if len(urls) < 4:
+        cse = google_cse_search(f"{artist} official site presale signup verified fan youtube spotify tiktok", num=6)
+        urls.extend(_extract_urls(cse))
+
+    def is_official_site(u: str, _t: str) -> bool:
+        u_lower = u.lower()
+        if any(d in u_lower for d in ["wikipedia.org", "facebook.com", "instagram.com", "twitter.com", "x.com"]):
+            return False
+        if any(d in u_lower for d in ["youtube.com", "youtu.be", "spotify.com", "tiktok.com", "ticketmaster.com", "livenation.com"]):
+            return False
+        return True
+
+    def is_presale(u: str, t: str) -> bool:
+        text = f"{u} {t}".lower()
+        return any(k in text for k in ["presale", "verified fan", "registration", "signup", "register", "fan registration"])
+
+    official_site = _find_first_url(urls, is_official_site)
+    presale_url = _find_first_url(urls, is_presale)
+    youtube_url = _find_first_url(urls, lambda u, _t: _is_social_domain(u, "youtube.com") or _is_social_domain(u, "youtu.be"))
+    spotify_url = _find_first_url(urls, lambda u, _t: _is_social_domain(u, "spotify.com"))
+    tiktok_url = _find_first_url(urls, lambda u, _t: _is_social_domain(u, "tiktok.com"))
+
+    tiktok_followers = ""
+    for u, t in urls:
+        if tiktok_url and tiktok_url in u:
+            match = re.search(r"([\d,.]+)\s*followers", t.lower())
+            if match:
+                tiktok_followers = match.group(1)
+                break
+
+    return {
+        "official_site": official_site or "",
+        "presale_url": presale_url or "",
+        "youtube_url": youtube_url or "",
+        "spotify_url": spotify_url or "",
+        "tiktok_url": tiktok_url or "",
+        "tiktok_followers": tiktok_followers,
+        "updated_at": time.time(),
+    }
+
+def _resolve_youtube_channel_id(url: str) -> Optional[str]:
+    if not url or not YOUTUBE_API_KEY:
+        return None
+    import requests
+    u = url.strip()
+    if "/channel/" in u:
+        return u.split("/channel/")[-1].split("/")[0]
+    handle_match = re.search(r"/@([^/?]+)", u)
+    if handle_match:
+        query = handle_match.group(1)
+    else:
+        user_match = re.search(r"/user/([^/?]+)", u)
+        query = user_match.group(1) if user_match else ""
+    if not query:
+        return None
+    params = {
+        "part": "snippet",
+        "type": "channel",
+        "q": query,
+        "maxResults": 1,
+        "key": YOUTUBE_API_KEY,
+    }
+    try:
+        resp = requests.get("https://www.googleapis.com/youtube/v3/search", params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        items = data.get("items") or []
+        if items:
+            return (items[0].get("id") or {}).get("channelId")
+    except Exception:
+        return None
+    return None
+
+def _fetch_youtube_stats(channel_url: str) -> Dict[str, Any]:
+    if not channel_url or not YOUTUBE_API_KEY:
+        return {"updated_at": time.time()}
+    import requests
+    channel_id = _resolve_youtube_channel_id(channel_url)
+    if not channel_id:
+        return {"updated_at": time.time()}
+    params = {
+        "part": "statistics",
+        "id": channel_id,
+        "key": YOUTUBE_API_KEY,
+    }
+    try:
+        resp = requests.get("https://www.googleapis.com/youtube/v3/channels", params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        items = data.get("items") or []
+        if items:
+            stats = (items[0].get("statistics") or {})
+            return {
+                "channel_id": channel_id,
+                "subscribers": int(stats.get("subscriberCount") or 0),
+                "views": int(stats.get("viewCount") or 0),
+                "updated_at": time.time(),
+            }
+    except Exception:
+        return {"updated_at": time.time()}
+    return {"updated_at": time.time()}
+
+def _spotify_get_token() -> Optional[str]:
+    global _SPOTIFY_TOKEN, _SPOTIFY_TOKEN_EXPIRY
+    if _SPOTIFY_TOKEN and time.time() < _SPOTIFY_TOKEN_EXPIRY:
+        return _SPOTIFY_TOKEN
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+    import requests
+    auth = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode("utf-8")).decode("utf-8")
+    headers = {"Authorization": f"Basic {auth}"}
+    data = {"grant_type": "client_credentials"}
+    try:
+        resp = requests.post("https://accounts.spotify.com/api/token", headers=headers, data=data, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json() or {}
+        token = payload.get("access_token")
+        expires_in = int(payload.get("expires_in") or 3600)
+        if token:
+            _SPOTIFY_TOKEN = token
+            _SPOTIFY_TOKEN_EXPIRY = time.time() + max(300, expires_in - 60)
+            return token
+    except Exception:
+        return None
+    return None
+
+def _fetch_spotify_stats(artist: str) -> Dict[str, Any]:
+    token = _spotify_get_token()
+    if not token or not artist:
+        return {"updated_at": time.time()}
+    import requests
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {"q": artist, "type": "artist", "limit": 1}
+    try:
+        resp = requests.get("https://api.spotify.com/v1/search", headers=headers, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        items = (data.get("artists") or {}).get("items") or []
+        if items:
+            item = items[0]
+            followers = (item.get("followers") or {}).get("total") or 0
+            popularity = item.get("popularity") or 0
+            return {
+                "spotify_url": (item.get("external_urls") or {}).get("spotify") or "",
+                "followers": int(followers),
+                "popularity": int(popularity),
+                "updated_at": time.time(),
+            }
+    except Exception:
+        return {"updated_at": time.time()}
+    return {"updated_at": time.time()}
+
+def _compute_artist_score(
+    artist: str,
+    spotify_stats: Dict[str, Any],
+    youtube_stats: Dict[str, Any],
+) -> Tuple[int, int]:
+    score = 10.0
+    if viking_db and hasattr(viking_db, "get_artist_counts_time_aware"):
+        try:
+            counts = viking_db.get_artist_counts_time_aware(artist)
+            score += min(30.0, float(counts.get("events_30d", 0)) * 5.0)
+            score += min(20.0, float(counts.get("news_30d", 0)) * 4.0)
+        except Exception:
+            pass
+
+    sp_pop = float(spotify_stats.get("popularity") or 0)
+    sp_followers = float(spotify_stats.get("followers") or 0)
+    yt_subs = float(youtube_stats.get("subscribers") or 0)
+    yt_views = float(youtube_stats.get("views") or 0)
+
+    score += sp_pop * 0.4
+    score += min(20.0, math.log10(sp_followers + 1) * 4.0)
+    score += min(15.0, math.log10(yt_subs + 1) * 3.0)
+    score += min(10.0, math.log10(yt_views + 1) * 2.0)
+
+    score = max(0.0, min(100.0, score))
+    stars = max(1, min(5, int(round(score / 20.0))))
+    return int(round(score)), stars
+
+def _best_cities_for_artist(score: int) -> List[str]:
+    tiers = [
+        ("New York, NY", 95),
+        ("Los Angeles, CA", 95),
+        ("Chicago, IL", 90),
+        ("Dallas, TX", 88),
+        ("Houston, TX", 86),
+        ("Atlanta, GA", 85),
+        ("San Francisco, CA", 85),
+        ("Seattle, WA", 82),
+        ("Boston, MA", 82),
+        ("Philadelphia, PA", 80),
+        ("Miami, FL", 80),
+        ("Denver, CO", 78),
+        ("Phoenix, AZ", 76),
+        ("Minneapolis, MN", 74),
+        ("Detroit, MI", 72),
+        ("Nashville, TN", 72),
+        ("Austin, TX", 70),
+        ("Portland, OR", 70),
+    ]
+    adjusted = []
+    for city, tier in tiers:
+        adjusted.append((city, tier + (score - 50) * 0.2))
+    adjusted.sort(key=lambda x: x[1], reverse=True)
+    return [c for c, _ in adjusted[:8]]
+
+def _city_tier_score(city: str) -> int:
+    city_lower = (city or "").lower()
+    if any(key in city_lower for key in ["new york", "los angeles", "chicago"]):
+        return 95
+    if any(key in city_lower for key in ["dallas", "houston", "atlanta", "san francisco"]):
+        return 85
+    if any(key in city_lower for key in ["seattle", "boston", "philadelphia", "miami"]):
+        return 80
+    return 70
+
+def _sellout_probability(
+    artist_score: int,
+    city_tier: int,
+    capacity: Optional[int],
+    presale_bonus: bool,
+) -> int:
+    base = artist_score * 0.6 + city_tier * 0.4
+    if capacity:
+        if capacity < 5000:
+            base += 15
+        elif capacity < 10000:
+            base += 8
+        elif capacity < 20000:
+            base += 4
+    if presale_bonus:
+        base += 5
+    return max(0, min(100, int(round(base))))
+
+def build_artist_intel(artist: str) -> Dict[str, Any]:
+    artist = (artist or "").strip()
+    if not artist:
+        return {}
+    cache = load_cache()
+    key = normalize_artist_key(artist)
+    entry = _cache_get_artist(cache, key)
+
+    urls = _get_cached_urls(entry)
+    if not urls:
+        urls = _discover_profile_links(artist)
+        entry["urls"] = urls
+
+    stats = _get_cached_stats(entry)
+    if not stats:
+        youtube_stats = _fetch_youtube_stats(urls.get("youtube_url", ""))
+        spotify_stats = _fetch_spotify_stats(artist)
+        stats = {
+            "youtube": youtube_stats,
+            "spotify": spotify_stats,
+            "updated_at": time.time(),
+        }
+        entry["stats"] = stats
+
+    spotify_stats = stats.get("spotify", {}) if isinstance(stats, dict) else {}
+    youtube_stats = stats.get("youtube", {}) if isinstance(stats, dict) else {}
+    score, stars = _compute_artist_score(artist, spotify_stats, youtube_stats)
+
+    entry["computed"] = {
+        "score": score,
+        "stars": stars,
+        "best_cities": _best_cities_for_artist(score),
+        "updated_at": time.time(),
+    }
+
+    _cache_set_artist(cache, key, entry)
+    save_cache(cache)
+
+    return {
+        "artist": artist,
+        "urls": urls,
+        "stats": stats,
+        "score": score,
+        "stars": stars,
+        "best_cities": entry["computed"]["best_cities"],
+    }
+
+def _format_stat_number(value: Any) -> str:
+    try:
+        return f"{int(value):,}"
+    except Exception:
+        return "—"
+
+def _format_artist_intel_message(artist: str, intel: Dict[str, Any], events: List[Dict[str, Any]]) -> str:
+    stars = intel.get("stars") or 0
+    score = intel.get("score") or 0
+    urls = intel.get("urls") or {}
+    stats = intel.get("stats") or {}
+    spotify_stats = (stats.get("spotify") or {}) if isinstance(stats, dict) else {}
+    youtube_stats = (stats.get("youtube") or {}) if isinstance(stats, dict) else {}
+
+    lines = [f"🎯 Artist Intel v1.1 — **{artist}**"]
+    lines.append(f"⭐ Stars: {stars} | Score: {score}/100")
+
+    if urls.get("official_site"):
+        lines.append(f"🌐 Official: {urls.get('official_site')}")
+    if urls.get("presale_url"):
+        lines.append(f"🎟️ Presale/Signup: {urls.get('presale_url')}")
+
+    yt_url = urls.get("youtube_url")
+    if yt_url:
+        yt_subs = _format_stat_number(youtube_stats.get("subscribers"))
+        yt_views = _format_stat_number(youtube_stats.get("views"))
+        lines.append(f"▶️ YouTube: {yt_url} (Subs: {yt_subs} | Views: {yt_views})")
+
+    sp_url = spotify_stats.get("spotify_url") or urls.get("spotify_url")
+    if sp_url:
+        sp_followers = _format_stat_number(spotify_stats.get("followers"))
+        sp_pop = spotify_stats.get("popularity")
+        pop_display = f"{sp_pop}" if sp_pop is not None else "—"
+        lines.append(f"🎵 Spotify: {sp_url} (Followers: {sp_followers} | Popularity: {pop_display})")
+
+    tt_url = urls.get("tiktok_url")
+    if tt_url:
+        tt_followers = urls.get("tiktok_followers") or "—"
+        lines.append(f"🎬 TikTok: {tt_url} (Followers: {tt_followers})")
+
+    best_cities = intel.get("best_cities") or []
+    if best_cities:
+        lines.append("🏙️ Best cities: " + ", ".join(best_cities))
+
+    if events:
+        lines.append("🎟️ Top events by sellout probability:")
+        for ev in events[:10]:
+            lines.append(ev.get("line") or "")
+
+    return "\n".join([line for line in lines if line]).strip()[:1900]
+
+def _build_event_lines(artist_score: int, presale_url: str, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    lines: List[Dict[str, Any]] = []
+    for ev in events:
+        city = ev.get("city") or ""
+        city_tier = _city_tier_score(city)
+        prob = _sellout_probability(artist_score, city_tier, None, bool(presale_url))
+        name = ev.get("name") or "Event"
+        date = ev.get("date") or ""
+        venue = ev.get("venue") or ""
+        url = ev.get("url") or ""
+        line = f"• {prob}% — {name} ({date}) {venue} {city}".strip()
+        if url:
+            line += f" — {url}"
+        if presale_url:
+            line += f" | Presale: {presale_url}"
+        lines.append({"prob": prob, "line": line})
+    lines.sort(key=lambda x: x.get("prob", 0), reverse=True)
+    return lines
+
+def _tour_scan_intel_message(item: Dict[str, Any]) -> Optional[str]:
+    title = (item.get("title") or "").strip()
+    link = (item.get("link") or "").strip()
+    artist = title or "Unknown Artist"
+    intel = build_artist_intel(artist)
+    if not intel:
+        return None
+    best_cities = intel.get("best_cities") or []
+    urls = intel.get("urls") or {}
+    lines = [
+        f"🗺️ New tour item: {title}" if title else "🗺️ New tour item",
+        link,
+        f"⭐ Stars: {intel.get('stars')} | Score: {intel.get('score')}/100",
+    ]
+    if best_cities:
+        lines.append("🏙️ Best cities: " + ", ".join(best_cities[:3]))
+    if urls.get("official_site"):
+        lines.append(f"🌐 Official: {urls.get('official_site')}")
+    if urls.get("presale_url"):
+        lines.append(f"🎟️ Presale/Signup: {urls.get('presale_url')}")
+    return "\n".join([l for l in lines if l]).strip()
+
+# --------------------
 # Discord client
 # --------------------
 intents = discord.Intents.default()
@@ -141,12 +666,18 @@ async def _get_channel(channel_id: int) -> Optional[discord.abc.Messageable]:
             return None
     return ch
 
-async def _send_webhook(webhook_url: str, content: str, embeds: Optional[list] = None) -> None:
+async def _send_webhook(
+    webhook_url: Optional[str],
+    content: Optional[str],
+    embeds: Optional[list] = None,
+) -> None:
     if not webhook_url:
+        return
+    if content is None and not embeds:
         return
     try:
         wh = discord.SyncWebhook.from_url(webhook_url)
-        await asyncio.to_thread(wh.send, content=content, embeds=embeds or None, wait=False)
+        await asyncio.to_thread(wh.send, content=content or "", embeds=embeds or None, wait=False)
     except Exception as e:
         logger.warning("Webhook send failed: %s", e)
 
@@ -289,7 +820,13 @@ async def price_monitor_loop(interval_seconds: int = 900) -> None:
     while True:
         try:
             if hasattr(price_monitor, "poll_prices_once"):
-                await asyncio.to_thread(price_monitor.poll_prices_once, post_price_alert)
+                try:
+                    items = await asyncio.to_thread(price_monitor.poll_prices_once, post_price_alert)
+                except TypeError:
+                    items = await asyncio.to_thread(price_monitor.poll_prices_once)
+                if items:
+                    for item in items or []:
+                        await post_price_alert(item)
             elif hasattr(price_monitor, "poll_once"):
                 await asyncio.to_thread(price_monitor.poll_once, post_price_alert)
         except Exception as e:
@@ -335,14 +872,14 @@ def start_tour_scan_monitor() -> None:
         return
 
     try:
-        starter(
-            discord_client=client,
-            channel_id=TOUR_SCAN_ALERT_CHANNEL_ID,
-            webhook_url=TOUR_SCAN_WEBHOOK_URL,
-        )
+        starter(post_callback=_tour_scan_intel_message)
         logger.info("Tour scan background thread started.")
     except TypeError:
-        starter({"discord_client": client, "channel_id": TOUR_SCAN_ALERT_CHANNEL_ID, "webhook_url": TOUR_SCAN_WEBHOOK_URL})
+        starter(
+            {
+                "post_callback": _tour_scan_intel_message,
+            }
+        )
         logger.info("Tour scan background thread started.")
     except Exception as e:
         STATUS["last_error"] = f"tour_scan_monitor start: {e}"
@@ -443,6 +980,22 @@ async def events_cmd(interaction: discord.Interaction, artist: str):
             venue = e.get("venue") or ""
             lines.append(f"• `{eid}` — {name} ({date}) {venue}".strip())
         await interaction.followup.send("\n".join(lines)[:1900])
+    except Exception as e:
+        await interaction.followup.send(f"Error: {e}")
+
+@tree.command(name="intel", description="Artist Intel v1.1 (links, stats, routing, sellout odds).")
+@app_commands.describe(artist="Artist name")
+async def intel_cmd(interaction: discord.Interaction, artist: str):
+    await interaction.response.defer(thinking=True)
+    try:
+        intel = await asyncio.to_thread(build_artist_intel, artist)
+        events: List[Dict[str, Any]] = []
+        if search_events_for_artist:
+            events = await asyncio.to_thread(search_events_for_artist, artist, 15)
+        presale_url = (intel.get("urls") or {}).get("presale_url") or ""
+        event_lines = _build_event_lines(int(intel.get("score") or 0), presale_url, events)
+        message = _format_artist_intel_message(artist, intel, event_lines)
+        await interaction.followup.send(message or "No intel available yet.")
     except Exception as e:
         await interaction.followup.send(f"Error: {e}")
 
