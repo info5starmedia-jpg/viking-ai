@@ -1,17 +1,16 @@
 # Summary
-- Add usage logging + tier overrides in SQLite with paid-tier gating and admin-only intel refresh.
-- Introduce scheduled artist intel auto-refresh with concurrency/TTL safeguards and status visibility.
-- Tune sell-out probability scoring with capacity and momentum inputs.
+- Add slash command sync diagnostics, tracking, and manual sync tools.
+- Implement standalone Discord REST sync diagnostic script without external deps.
+- Remove `.env.example` and document validation outputs.
 
 # Changes
-- Added `usage_db.py` for `usage_events` logging + `guild_tiers` overrides (migration-safe).
-- Wired tier gating, usage logging, and intel refresh loop/command into `bot.py`.
-- Updated sell-out probability model and event scoring to use capacity/momentum when available.
-- Added `.env.example` entries for tiers and intel refresh settings.
+- Added sync state tracking, `/diag`, and `/sync_now` commands plus robust sync routing in `bot.py`.
+- Added `tools/diag_sync.py` to inspect token app id and list global/guild commands via REST.
+- Removed `.env.example` from the repo.
 
-# Tests
+# Validation
 ```sh
-python -m py_compile bot.py tour_scan_monitor.py verified_fan_monitor.py price_monitor.py
+python -m py_compile bot.py usage_db.py
 ```
 _Output:_
 ```
@@ -19,9 +18,17 @@ _Output:_
 ```
 
 ```sh
+python tools/diag_sync.py
+```
+_Output:_
+```
+DISCORD_TOKEN is not set in /opt/viking-ai/.env
+```
+
+```sh
 python - <<'PY'
 import bot
-print("loaded bot ok")
+print("registered:", sorted([c.name for c in bot.tree.get_commands()]))
 PY
 ```
 _Output:_
@@ -33,17 +40,21 @@ Traceback (most recent call last):
 ModuleNotFoundError: No module named 'discord'
 ```
 
-# Rollout Notes
-- Ensure `discord.py` is installed in the runtime virtualenv before running `python - <<'PY'` import checks.
-- Populate `DEFAULT_TIER`, `ADMIN_USER_IDS`, `PRO_GUILD_IDS`, and intel refresh envs in `/opt/viking-ai/.env`.
-- Intel refresh loop can be disabled by setting `INTEL_REFRESH_SECONDS=0`.
-
-# How to Test (server)
+# Service Validation
 ```sh
-source /opt/viking-ai/.venv/bin/activate
-python -m py_compile /opt/viking-ai/bot.py /opt/viking-ai/tour_scan_monitor.py /opt/viking-ai/verified_fan_monitor.py /opt/viking-ai/price_monitor.py
-python - <<'PY'
-import bot
-print("loaded bot ok")
-PY
+sudo systemctl restart viking-ai
+```
+_Output:_
+```
+System has not been booted with systemd as init system (PID 1). Can't operate.
+Failed to connect to bus: Host is down
+```
+
+```sh
+sudo journalctl -u viking-ai -n 120 --no-pager -l --since "3 minutes ago"
+```
+_Output:_
+```
+No journal files were found.
+-- No entries --
 ```
