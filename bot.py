@@ -76,6 +76,8 @@ except Exception:
 # Config
 # --------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
+GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else 0
 
 PRICE_ALERT_CHANNEL_ID = int(os.getenv("PRICE_ALERT_CHANNEL_ID", "0") or "0")
 VERIFIED_FAN_ALERT_CHANNEL_ID = int(os.getenv("VERIFIED_FAN_ALERT_CHANNEL_ID", "0") or "0")
@@ -127,6 +129,13 @@ STATUS: Dict[str, Any] = {
     "last_intel_refresh_unix": None,
     "last_intel_refresh_summary": None,
 }
+SYNC_STATE: Dict[str, Any] = {
+    "last_sync_unix": None,
+    "last_sync_target": None,
+    "last_sync_command_count": None,
+    "last_sync_ok": None,
+    "last_sync_error": None,
+}
 
 _artist_cache_lock = threading.Lock()
 _SPOTIFY_TOKEN: Optional[str] = None
@@ -155,6 +164,11 @@ def _git_rev() -> str:
         return out.decode().strip()
     except Exception:
         return "unknown"
+
+def _truncate_text(text: str, max_chars: int = 1800) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 1)] + "…"
 
 def _redact(s: str, keep: int = 6) -> str:
     if not s:
@@ -229,6 +243,36 @@ async def _record_usage(
         latency_ms,
         extra or {},
     )
+
+def _sync_target() -> Tuple[str, Optional[discord.Object]]:
+    if GUILD_ID:
+        return f"guild:{GUILD_ID}", discord.Object(id=GUILD_ID)
+    return "global", None
+
+def _update_sync_state(ok: bool, target: str, count: int, error: Optional[str]) -> None:
+    SYNC_STATE["last_sync_unix"] = time.time()
+    SYNC_STATE["last_sync_target"] = target
+    SYNC_STATE["last_sync_command_count"] = count
+    SYNC_STATE["last_sync_ok"] = ok
+    SYNC_STATE["last_sync_error"] = error
+
+async def _sync_commands(source: str) -> Dict[str, Any]:
+    target, guild = _sync_target()
+    try:
+        if guild:
+            tree.copy_global_to(guild=guild)
+            synced = await tree.sync(guild=guild)
+            logger.info("Slash commands synced to guild %s (%s).", GUILD_ID, source)
+        else:
+            synced = await tree.sync()
+            logger.info("Slash commands synced globally (%s).", source)
+        count = len(synced or [])
+        _update_sync_state(True, target, count, None)
+        return {"ok": True, "target": target, "count": count}
+    except Exception as e:
+        logger.warning("Slash sync failed (%s): %s", source, e)
+        _update_sync_state(False, target, 0, str(e))
+        return {"ok": False, "target": target, "count": 0, "error": str(e)}
 
 # --------------------
 # Artist intel helpers
@@ -1267,6 +1311,53 @@ async def debug_cmd(interaction: discord.Interaction):
     finally:
         await _record_usage("debug", interaction, ok, int((time.monotonic() - start_time) * 1000))
 
+@tree.command(name="diag", description="Slash command diagnostics (sync, env, IDs).")
+async def diag_cmd(interaction: discord.Interaction):
+    start_time = time.monotonic()
+    ok = False
+    try:
+        app_id = getattr(client, "application_id", None)
+        command_names = sorted({c.name for c in tree.get_commands()})
+        lines = [
+            f"rev: {_git_rev()}",
+            f"uptime_seconds: {_uptime_seconds()}",
+            f"memory_mb: {round(_memory_mb(), 1)}",
+            f"application_id: {app_id or 'unknown'}",
+            f"guild_id: {GUILD_ID or 'not set'}",
+            f"sync_target: {SYNC_STATE.get('last_sync_target') or _sync_target()[0]}",
+            f"registered_commands: {', '.join(command_names) or 'none'}",
+            f"last_sync_unix: {SYNC_STATE.get('last_sync_unix')}",
+            f"last_sync_count: {SYNC_STATE.get('last_sync_command_count')}",
+            f"last_sync_ok: {SYNC_STATE.get('last_sync_ok')}",
+            f"last_sync_error: {SYNC_STATE.get('last_sync_error') or 'none'}",
+        ]
+        message = _truncate_text("\n".join(lines))
+        await interaction.response.send_message(message, ephemeral=True)
+        ok = True
+    finally:
+        await _record_usage("diag", interaction, ok, int((time.monotonic() - start_time) * 1000))
+
+@tree.command(name="sync_now", description="Force a slash command sync (ADMIN only).")
+async def sync_now_cmd(interaction: discord.Interaction):
+    start_time = time.monotonic()
+    ok = False
+    try:
+        if not await _require_tier(interaction, "ADMIN"):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        result = await _sync_commands("manual")
+        target = result.get("target")
+        count = result.get("count")
+        if result.get("ok"):
+            msg = f"✅ Sync complete ({target}). Commands synced: {count}."
+            await interaction.followup.send(msg, ephemeral=True)
+            ok = True
+        else:
+            err = result.get("error") or "unknown error"
+            await interaction.followup.send(f"⚠️ Sync failed ({target}): {err}", ephemeral=True)
+    finally:
+        await _record_usage("sync_now", interaction, ok, int((time.monotonic() - start_time) * 1000))
+
 @tree.command(name="news_now", description="Get latest tour news for an artist.")
 @app_commands.describe(artist="Artist name")
 async def news_now_cmd(interaction: discord.Interaction, artist: str):
@@ -1400,11 +1491,7 @@ async def intel_refresh_cmd(interaction: discord.Interaction):
 # --------------------
 @client.event
 async def on_ready():
-    try:
-        await tree.sync()
-        logger.info("Slash commands synced.")
-    except Exception as e:
-        logger.warning("Slash sync failed: %s", e)
+    await _sync_commands("startup")
 
     logger.info("Logged in as %s", client.user)
 
