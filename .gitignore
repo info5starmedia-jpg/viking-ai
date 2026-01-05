@@ -44,3 +44,21 @@ cache/
 *.txt
 
 # If you want to track specific files later, we can whitelist with !filename.ext
+
+# --- Viking AI local/backup artifacts ---
+*.bak
+*.bak_*
+*.save
+*_before_shim
+_archive/
+opt_viking-ai-private-backups/
+setup_log.txt
+*.log
+
+# python cache
+__pycache__/
+*.pyc
+
+# env
+.env
+.env.*
