@@ -5,7 +5,6 @@
 ![Viking Banner](https://img.shields.io/badge/VikingAI-Touring%20Intelligence-blueviolet?style=for-the-badge)
 ![Discord](https://img.shields.io/badge/Discord%20Bot-Active-7289DA?style=for-the-badge&logo=discord&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-yellow?style=for-the-badge&logo=python)
-![Status](https://img.shields.io/badge/LLM%20Stack-Gemini%20%7C%20OpenRouter%20%7C%20Tavily-brightgreen?style=for-the-badge)
 
 Viking AI is a **full-stack AI powerhouse** designed for:  
 ✔ Ticket flippers  
@@ -133,7 +132,7 @@ Slash Command:
 | Task | Model |
 |------|--------|
 | Long reasoning | **Gemini** |
-| Creativity, fallback | **OpenRouter (multiple models)** |
+| Creativity, fallback | **Gemini (multi-model)** |
 | Web lookups | **Tavily Search Engine** |
 
 The orchestrator chooses the best LLM depending on:
@@ -175,7 +174,7 @@ The orchestrator chooses the best LLM depending on:
 | 🔧 Auto-Repair | Fixes broken configs + API issues |
 | 👁 Watchdog | Restarts bot if it crashes |
 | 📅 Scheduler | Daily TM scanning + CSV handling |
-| 🧠 LLM Checker | Ensures Gemini/OpenRouter/Tavily are online |
+| 🧠 LLM Checker | Ensures Gemini/Tavily are online |
 
 Files that support this:
 - `viking_watchdog.py`  
@@ -214,7 +213,6 @@ Add to `.env`:
 ```
 DISCORD_BOT_TOKEN=
 TICKETMASTER_API_KEY=
-OPENROUTER_API_KEY=
 GEMINI_API_KEY=
 TAVILY_API_KEY=
 CANVA_CLIENT_ID=

@@ -1,7 +1,7 @@
 # Viking AI — The Ultimate Tour Intelligence & Growth Automation Bot
 
 Viking AI is a multi-agent Discord bot integrating Ticketmaster, Verified Fan monitoring, SEO engines,
-tour news analysis, sell‑out predictions, and a full LLM stack (Gemini + OpenRouter + Tavily).
+tour news analysis, sell‑out predictions, and a full LLM stack (Gemini + Tavily).
 
 ## 🚀 Key Features
 
@@ -30,7 +30,7 @@ tour news analysis, sell‑out predictions, and a full LLM stack (Gemini + OpenR
 - **/backlinks**
 
 ### 💬 AI Chat
-- Gemini + OpenRouter + Tavily  
+- Gemini + Tavily  
 - Direct touring insights, no fluff  
 
 ### 🎞 Video Creation
@@ -50,7 +50,6 @@ Stores events, demand, verified fan history, logs, and analytics.
 ```
 DISCORD_BOT_TOKEN=
 TICKETMASTER_API_KEY=
-OPENROUTER_API_KEY=
 GEMINI_API_KEY=
 TAVILY_API_KEY=
 CANVA_CLIENT_ID=

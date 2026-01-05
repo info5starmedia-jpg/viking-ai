@@ -1,1521 +1,1054 @@
-import os
+#!/usr/bin/env python3
+"""
+Viking AI Discord Bot (v1.0)
+
+Rules:
+- Single .env source of truth: /opt/viking-ai/.env (gitignored). No .env.example.
+- Resilient imports: missing optional modules should not crash the bot.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import base64
 import json
 import logging
-import math
-import re
+import os
 import subprocess
-import threading
 import time
-from typing import Any, Dict, Optional, List, Tuple
-
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
-# --------------------
-# Load env (absolute path so systemd WorkingDirectory doesn't matter)
-# --------------------
+# ---------------------------------------------------------------------
+# .env (single source of truth)
+# ---------------------------------------------------------------------
 load_dotenv("/opt/viking-ai/.env", override=False)
 
-# --------------------
+DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
+if not DISCORD_TOKEN:
+    raise SystemExit("DISCORD_TOKEN is missing in /opt/viking-ai/.env")
+
+GUILD_ID_STR = (os.getenv("GUILD_ID") or "").strip()
+GUILD_ID: int = int(GUILD_ID_STR) if GUILD_ID_STR.isdigit() else 0
+
+# Optional routing (channels or webhooks; none required)
+DEFAULT_CHANNEL_ID = int((os.getenv("DISCORD_CHANNEL_ID") or "0").strip() or 0)
+
+PRICE_ALERT_CHANNEL_ID = int((os.getenv("PRICE_ALERT_CHANNEL_ID") or "0").strip() or 0)
+VERIFIED_FAN_ALERT_CHANNEL_ID = int((os.getenv("VERIFIED_FAN_ALERT_CHANNEL_ID") or "0").strip() or 0)
+TOUR_SCAN_ALERT_CHANNEL_ID = int((os.getenv("TOUR_SCAN_ALERT_CHANNEL_ID") or "0").strip() or 0)
+
+PRICE_WEBHOOK_URL = (os.getenv("PRICE_WEBHOOK_URL") or "").strip()
+VERIFIED_FAN_WEBHOOK_URL = (os.getenv("VERIFIED_FAN_WEBHOOK_URL") or "").strip()
+TOUR_SCAN_WEBHOOK_URL = (os.getenv("TOUR_SCAN_WEBHOOK_URL") or "").strip()
+
+# Polling intervals (seconds)
+PRICE_POLL_SECONDS = int((os.getenv("PRICE_POLL_SECONDS") or "900").strip() or 900)
+VERIFIED_FAN_POLL_SECONDS = int((os.getenv("VERIFIED_FAN_POLL_SECONDS") or "7200").strip() or 7200)
+TOUR_SCAN_POLL_SECONDS = int((os.getenv("TOUR_SCAN_POLL_SECONDS") or "3600").strip() or 3600)
+INTEL_REFRESH_SECONDS = int((os.getenv("INTEL_REFRESH_SECONDS") or "21600").strip() or 21600)
+
+# A/B tour output mode:
+# - "fast" => headline + top cities + why (short)
+# - "full" => full intel style (events + on-sale placeholders + sellout score)
+TOUR_SCAN_MODE = (os.getenv("TOUR_SCAN_MODE") or "fast").strip().lower()
+
+# Ticketmaster surge watch poll (seconds). Default 30 min.
+TM_SURGE_POLL_SECONDS = int(os.getenv("TM_SURGE_POLL_SECONDS", "1800") or "1800")
+
+# Optional: explicit git revision (can be injected by CI)
+GIT_REV = (os.getenv("GIT_REV") or "").strip()
+
+# ---------------------------------------------------------------------
 # Logging
-# --------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# ---------------------------------------------------------------------
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("viking_ai")
 
-# --------------------
-# Optional imports (guarded)
-# --------------------
-try:
-    import price_monitor
-except Exception as e:
-    price_monitor = None
-    logger.warning("price_monitor import failed: %s", e)
+START_UNIX = time.time()
 
-try:
-    import verified_fan_monitor
-except Exception as e:
-    verified_fan_monitor = None
-    logger.warning("verified_fan_monitor import failed: %s", e)
-
-try:
-    import tour_scan_monitor
-except Exception as e:
-    tour_scan_monitor = None
-    logger.warning("tour_scan_monitor import failed: %s", e)
-
-try:
-    import viking_db
-except Exception:
-    viking_db = None
-
-try:
-    import usage_db
-except Exception:
-    usage_db = None
-
-try:
-    from ticketmaster_agent_v2 import search_events_for_artist, get_event_details
-except Exception:
-    search_events_for_artist = None
-    get_event_details = None
-
-try:
-    from agents.tour_news_agent_v3 import get_tour_news
-except Exception:
-    get_tour_news = None
-
-# --------------------
-# Config
-# --------------------
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-GUILD_ID_RAW = os.getenv("GUILD_ID", "").strip()
-GUILD_ID = int(GUILD_ID_RAW) if GUILD_ID_RAW.isdigit() else 0
-
-PRICE_ALERT_CHANNEL_ID = int(os.getenv("PRICE_ALERT_CHANNEL_ID", "0") or "0")
-VERIFIED_FAN_ALERT_CHANNEL_ID = int(os.getenv("VERIFIED_FAN_ALERT_CHANNEL_ID", "0") or "0")
-TOUR_SCAN_ALERT_CHANNEL_ID = int(os.getenv("TOUR_SCAN_ALERT_CHANNEL_ID", "0") or "0")
-
-VERIFIED_FAN_WEBHOOK_URL = os.getenv("VERIFIED_FAN_WEBHOOK_URL", "").strip()
-TOUR_SCAN_WEBHOOK_URL = os.getenv("TOUR_SCAN_WEBHOOK_URL", "").strip()
-
-VERIFIED_FAN_POLL_SECONDS = int(os.getenv("VERIFIED_FAN_POLL_SECONDS", "7200") or "7200")
-
-# Artist intel integrations
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
-GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY", "").strip()
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "").strip()
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
-
-ARTIST_CACHE_PATH = "/opt/viking-ai/artist_profiles.json"
-URL_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-STATS_CACHE_TTL_SECONDS = 24 * 60 * 60
-
-# Intel refresh
-INTEL_REFRESH_SECONDS = int(os.getenv("INTEL_REFRESH_SECONDS", "21600") or "21600")
-INTEL_REFRESH_MAX_ARTISTS = int(os.getenv("INTEL_REFRESH_MAX_ARTISTS", "30") or "30")
-INTEL_REFRESH_CONCURRENCY = int(os.getenv("INTEL_REFRESH_CONCURRENCY", "3") or "3")
-
-# Paid tiers
-DEFAULT_TIER = (os.getenv("DEFAULT_TIER", "FREE") or "FREE").strip().upper()
-ADMIN_USER_IDS = {i.strip() for i in (os.getenv("ADMIN_USER_IDS", "") or "").split(",") if i.strip()}
-PRO_GUILD_IDS = {i.strip() for i in (os.getenv("PRO_GUILD_IDS", "") or "").split(",") if i.strip()}
-
-# Prefixes (for a mixed channel)
-PRICE_PREFIX = (os.getenv("PRICE_PREFIX") or "[PRICE]").strip()
-VERIFIED_FAN_PREFIX = (os.getenv("VERIFIED_FAN_PREFIX") or "[VF]").strip()
-TOUR_SCAN_PREFIX = (os.getenv("TOUR_SCAN_PREFIX") or "[TOUR]").strip()
-
-# Health/Watchdog
-HEALTH_PING_SECONDS = int(os.getenv("HEALTH_PING_SECONDS", "60") or "60")
-STARTUP_NOTIFY = (os.getenv("STARTUP_NOTIFY", "1") or "1").strip().lower() not in ("0", "false", "no")
-
-START_TS = time.time()
-STATUS: Dict[str, Any] = {
-    "started_at_unix": START_TS,
-    "last_price_post_unix": None,
-    "last_vf_post_unix": None,
-    "last_tour_post_unix": None,
-    "last_error": None,
-    "last_intel_refresh_unix": None,
-    "last_intel_refresh_summary": None,
-}
-SYNC_STATE: Dict[str, Any] = {
-    "last_sync_unix": None,
-    "last_sync_target": None,
-    "last_sync_command_count": None,
-    "last_sync_ok": None,
-    "last_sync_error": None,
-}
-
-_artist_cache_lock = threading.Lock()
-_SPOTIFY_TOKEN: Optional[str] = None
-_SPOTIFY_TOKEN_EXPIRY: float = 0.0
-
-def _uptime_seconds() -> int:
-    return int(time.time() - START_TS)
-
-def _memory_mb() -> float:
-    # Works on Linux without extra deps
+# ---------------------------------------------------------------------
+# Best-effort optional imports (never crash on missing)
+# ---------------------------------------------------------------------
+def _try_import(name: str):
     try:
-        with open("/proc/self/statm", "r") as f:
-            pages = int(f.read().split()[0])
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        return (pages * page_size) / (1024 * 1024)
-    except Exception:
-        return -1.0
-
-def _git_rev() -> str:
-    try:
-        out = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd="/opt/viking-ai",
-            stderr=subprocess.DEVNULL,
-        )
-        return out.decode().strip()
-    except Exception:
-        return "unknown"
-
-def _truncate_text(text: str, max_chars: int = 1800) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[: max(0, max_chars - 1)] + "…"
-
-def _redact(s: str, keep: int = 6) -> str:
-    if not s:
-        return ""
-    if len(s) <= keep:
-        return "…" * len(s)
-    return s[:keep] + "…" * 6
-
-def _normalize_tier(tier: Optional[str]) -> str:
-    return (tier or "FREE").strip().upper() or "FREE"
-
-def _tier_value(tier: Optional[str]) -> int:
-    order = {"FREE": 0, "PRO": 1, "ADMIN": 2}
-    return order.get(_normalize_tier(tier), 0)
-
-def _get_guild_tier_sync(guild_id: Optional[str]) -> str:
-    if not guild_id:
-        return DEFAULT_TIER
-    if usage_db:
-        try:
-            override = usage_db.get_guild_tier_override(str(guild_id))
-        except Exception:
-            override = None
-        if override:
-            return _normalize_tier(override)
-    if str(guild_id) in PRO_GUILD_IDS:
-        return "PRO"
-    return DEFAULT_TIER
-
-async def _get_effective_tier(interaction: discord.Interaction) -> str:
-    user_id = str(interaction.user.id) if interaction.user else ""
-    if user_id and user_id in ADMIN_USER_IDS:
-        return "ADMIN"
-    guild_id = str(interaction.guild_id) if interaction.guild_id else None
-    return await asyncio.to_thread(_get_guild_tier_sync, guild_id)
-
-async def _send_ephemeral(interaction: discord.Interaction, message: str) -> None:
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
-
-async def _require_tier(interaction: discord.Interaction, min_tier: str) -> bool:
-    effective = await _get_effective_tier(interaction)
-    if _tier_value(effective) >= _tier_value(min_tier):
-        return True
-    await _send_ephemeral(
-        interaction,
-        f"🔒 `{min_tier}` required. Current tier: `{effective}`. Contact admin to upgrade.",
-    )
-    return False
-
-async def _record_usage(
-    command: str,
-    interaction: discord.Interaction,
-    ok: bool,
-    latency_ms: int,
-    extra: Optional[Dict[str, Any]] = None,
-) -> None:
-    if not usage_db:
-        return
-    guild_id = str(interaction.guild_id) if interaction.guild_id else None
-    channel_id = str(interaction.channel_id) if interaction.channel_id else None
-    user_id = str(interaction.user.id) if interaction.user else None
-    await asyncio.to_thread(
-        usage_db.record_usage,
-        command,
-        guild_id,
-        channel_id,
-        user_id,
-        ok,
-        latency_ms,
-        extra or {},
-    )
-
-def _sync_target() -> Tuple[str, Optional[discord.Object]]:
-    if GUILD_ID:
-        return f"guild:{GUILD_ID}", discord.Object(id=GUILD_ID)
-    return "global", None
-
-def _update_sync_state(ok: bool, target: str, count: int, error: Optional[str]) -> None:
-    SYNC_STATE["last_sync_unix"] = time.time()
-    SYNC_STATE["last_sync_target"] = target
-    SYNC_STATE["last_sync_command_count"] = count
-    SYNC_STATE["last_sync_ok"] = ok
-    SYNC_STATE["last_sync_error"] = error
-
-async def _sync_commands(source: str) -> Dict[str, Any]:
-    target, guild = _sync_target()
-    try:
-        if guild:
-            tree.copy_global_to(guild=guild)
-            synced = await tree.sync(guild=guild)
-            logger.info("Slash commands synced to guild %s (%s).", GUILD_ID, source)
-        else:
-            synced = await tree.sync()
-            logger.info("Slash commands synced globally (%s).", source)
-        count = len(synced or [])
-        _update_sync_state(True, target, count, None)
-        return {"ok": True, "target": target, "count": count}
+        return __import__(name)
     except Exception as e:
-        logger.warning("Slash sync failed (%s): %s", source, e)
-        _update_sync_state(False, target, 0, str(e))
-        return {"ok": False, "target": target, "count": 0, "error": str(e)}
-
-# --------------------
-# Artist intel helpers
-# --------------------
-def normalize_artist_key(artist: str) -> str:
-    cleaned = re.sub(r"[^a-z0-9]+", " ", (artist or "").lower()).strip()
-    return re.sub(r"\s+", " ", cleaned)
-
-def _ensure_cache_dir() -> None:
-    try:
-        os.makedirs(os.path.dirname(ARTIST_CACHE_PATH), exist_ok=True)
-    except Exception:
-        return
-
-def load_cache() -> Dict[str, Any]:
-    with _artist_cache_lock:
-        if not os.path.exists(ARTIST_CACHE_PATH):
-            return {}
-        try:
-            with open(ARTIST_CACHE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            return {}
-    return {}
-
-def save_cache(cache: Dict[str, Any]) -> None:
-    with _artist_cache_lock:
-        _ensure_cache_dir()
-        try:
-            with open(ARTIST_CACHE_PATH, "w", encoding="utf-8") as f:
-                json.dump(cache, f, indent=2, sort_keys=True)
-        except Exception:
-            return
-
-def _cache_get_artist(cache: Dict[str, Any], artist_key: str) -> Dict[str, Any]:
-    entry = cache.get(artist_key)
-    if isinstance(entry, dict):
-        return entry
-    return {}
-
-def _cache_set_artist(cache: Dict[str, Any], artist_key: str, data: Dict[str, Any]) -> None:
-    cache[artist_key] = data
-
-def _is_fresh(ts: Optional[float], ttl_seconds: int) -> bool:
-    if not ts:
-        return False
-    return (time.time() - float(ts)) <= ttl_seconds
-
-def _get_cached_urls(entry: Dict[str, Any]) -> Dict[str, Any]:
-    urls = entry.get("urls")
-    if isinstance(urls, dict) and _is_fresh(urls.get("updated_at"), URL_CACHE_TTL_SECONDS):
-        return urls
-    return {}
-
-def _get_cached_stats(entry: Dict[str, Any]) -> Dict[str, Any]:
-    stats = entry.get("stats")
-    if isinstance(stats, dict) and _is_fresh(stats.get("updated_at"), STATS_CACHE_TTL_SECONDS):
-        return stats
-    return {}
-
-def tavily_search(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
-    if not TAVILY_API_KEY or not query:
-        return []
-    import requests
-    payload = {
-        "api_key": TAVILY_API_KEY,
-        "query": query,
-        "search_depth": "basic",
-        "max_results": max(1, int(max_results)),
-    }
-    try:
-        resp = requests.post("https://api.tavily.com/search", json=payload, timeout=20)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        results = data.get("results") or []
-        return [r for r in results if isinstance(r, dict)]
-    except Exception:
-        return []
-
-def google_cse_search(query: str, num: int = 5) -> List[Dict[str, Any]]:
-    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_ID or not query:
-        return []
-    import requests
-    params = {
-        "key": GOOGLE_CSE_API_KEY,
-        "cx": GOOGLE_CSE_ID,
-        "q": query,
-        "num": max(1, min(10, int(num))),
-    }
-    try:
-        resp = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        items = data.get("items") or []
-        return [i for i in items if isinstance(i, dict)]
-    except Exception:
-        return []
-
-def _extract_urls(results: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
-    urls: List[Tuple[str, str]] = []
-    for r in results or []:
-        url = (r.get("url") or r.get("link") or "").strip()
-        title = (r.get("title") or r.get("snippet") or r.get("content") or "").strip()
-        if url:
-            urls.append((url, title))
-    return urls
-
-def _find_first_url(urls: List[Tuple[str, str]], predicate) -> Optional[str]:
-    for url, title in urls:
-        try:
-            if predicate(url, title):
-                return url
-        except Exception:
-            continue
-    return None
-
-def _is_social_domain(url: str, domain: str) -> bool:
-    return domain in url.lower()
-
-def _discover_profile_links(artist: str) -> Dict[str, Any]:
-    urls: List[Tuple[str, str]] = []
-    tavily = tavily_search(f"{artist} official site presale signup verified fan youtube spotify tiktok", max_results=6)
-    urls.extend(_extract_urls(tavily))
-
-    if len(urls) < 4:
-        cse = google_cse_search(f"{artist} official site presale signup verified fan youtube spotify tiktok", num=6)
-        urls.extend(_extract_urls(cse))
-
-    def is_official_site(u: str, _t: str) -> bool:
-        u_lower = u.lower()
-        if any(d in u_lower for d in ["wikipedia.org", "facebook.com", "instagram.com", "twitter.com", "x.com"]):
-            return False
-        if any(d in u_lower for d in ["youtube.com", "youtu.be", "spotify.com", "tiktok.com", "ticketmaster.com", "livenation.com"]):
-            return False
-        return True
-
-    def is_presale(u: str, t: str) -> bool:
-        text = f"{u} {t}".lower()
-        return any(k in text for k in ["presale", "verified fan", "registration", "signup", "register", "fan registration"])
-
-    official_site = _find_first_url(urls, is_official_site)
-    presale_url = _find_first_url(urls, is_presale)
-    youtube_url = _find_first_url(urls, lambda u, _t: _is_social_domain(u, "youtube.com") or _is_social_domain(u, "youtu.be"))
-    spotify_url = _find_first_url(urls, lambda u, _t: _is_social_domain(u, "spotify.com"))
-    tiktok_url = _find_first_url(urls, lambda u, _t: _is_social_domain(u, "tiktok.com"))
-
-    tiktok_followers = ""
-    for u, t in urls:
-        if tiktok_url and tiktok_url in u:
-            match = re.search(r"([\d,.]+)\s*followers", t.lower())
-            if match:
-                tiktok_followers = match.group(1)
-                break
-
-    return {
-        "official_site": official_site or "",
-        "presale_url": presale_url or "",
-        "youtube_url": youtube_url or "",
-        "spotify_url": spotify_url or "",
-        "tiktok_url": tiktok_url or "",
-        "tiktok_followers": tiktok_followers,
-        "updated_at": time.time(),
-    }
-
-def _resolve_youtube_channel_id(url: str) -> Optional[str]:
-    if not url or not YOUTUBE_API_KEY:
+        logger.info("Optional import skipped: %s (%s)", name, e)
         return None
-    import requests
-    u = url.strip()
-    if "/channel/" in u:
-        return u.split("/channel/")[-1].split("/")[0]
-    handle_match = re.search(r"/@([^/?]+)", u)
-    if handle_match:
-        query = handle_match.group(1)
-    else:
-        user_match = re.search(r"/user/([^/?]+)", u)
-        query = user_match.group(1) if user_match else ""
-    if not query:
-        return None
-    params = {
-        "part": "snippet",
-        "type": "channel",
-        "q": query,
-        "maxResults": 1,
-        "key": YOUTUBE_API_KEY,
-    }
-    try:
-        resp = requests.get("https://www.googleapis.com/youtube/v3/search", params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        items = data.get("items") or []
-        if items:
-            return (items[0].get("id") or {}).get("channelId")
-    except Exception:
-        return None
-    return None
 
-def _fetch_youtube_stats(channel_url: str) -> Dict[str, Any]:
-    if not channel_url or not YOUTUBE_API_KEY:
-        return {"updated_at": time.time()}
-    import requests
-    channel_id = _resolve_youtube_channel_id(channel_url)
-    if not channel_id:
-        return {"updated_at": time.time()}
-    params = {
-        "part": "statistics",
-        "id": channel_id,
-        "key": YOUTUBE_API_KEY,
-    }
-    try:
-        resp = requests.get("https://www.googleapis.com/youtube/v3/channels", params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        items = data.get("items") or []
-        if items:
-            stats = (items[0].get("statistics") or {})
-            return {
-                "channel_id": channel_id,
-                "subscribers": int(stats.get("subscriberCount") or 0),
-                "views": int(stats.get("viewCount") or 0),
-                "updated_at": time.time(),
-            }
-    except Exception:
-        return {"updated_at": time.time()}
-    return {"updated_at": time.time()}
+price_monitor = _try_import("price_monitor")
+verified_fan_monitor = _try_import("verified_fan_monitor")
+tour_scan_monitor = _try_import("tour_scan_monitor")
+tm_surge_watch = _try_import("tm_surge_watch")
 
-def _spotify_get_token() -> Optional[str]:
-    global _SPOTIFY_TOKEN, _SPOTIFY_TOKEN_EXPIRY
-    if _SPOTIFY_TOKEN and time.time() < _SPOTIFY_TOKEN_EXPIRY:
-        return _SPOTIFY_TOKEN
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        return None
-    import requests
-    auth = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode("utf-8")).decode("utf-8")
-    headers = {"Authorization": f"Basic {auth}"}
-    data = {"grant_type": "client_credentials"}
-    try:
-        resp = requests.post("https://accounts.spotify.com/api/token", headers=headers, data=data, timeout=20)
-        resp.raise_for_status()
-        payload = resp.json() or {}
-        token = payload.get("access_token")
-        expires_in = int(payload.get("expires_in") or 3600)
-        if token:
-            _SPOTIFY_TOKEN = token
-            _SPOTIFY_TOKEN_EXPIRY = time.time() + max(300, expires_in - 60)
-            return token
-    except Exception:
-        return None
-    return None
+ticketmaster_agent = _try_import("ticketmaster_agent")
+tour_news_agent_v3 = _try_import("tour_news_agent_v3")
+tour_intel_agent = _try_import("tour_intel_agent")
 
-def _fetch_spotify_stats(artist: str) -> Dict[str, Any]:
-    token = _spotify_get_token()
-    if not token or not artist:
-        return {"updated_at": time.time()}
-    import requests
-    headers = {"Authorization": f"Bearer {token}"}
-    params = {"q": artist, "type": "artist", "limit": 1}
-    try:
-        resp = requests.get("https://api.spotify.com/v1/search", headers=headers, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json() or {}
-        items = (data.get("artists") or {}).get("items") or []
-        if items:
-            item = items[0]
-            followers = (item.get("followers") or {}).get("total") or 0
-            popularity = item.get("popularity") or 0
-            return {
-                "spotify_url": (item.get("external_urls") or {}).get("spotify") or "",
-                "followers": int(followers),
-                "popularity": int(popularity),
-                "updated_at": time.time(),
-            }
-    except Exception:
-        return {"updated_at": time.time()}
-    return {"updated_at": time.time()}
+spotify_agent = _try_import("spotify_agent")
+youtube_agent = _try_import("youtube_agent")
+tiktok_agent = _try_import("tiktok_agent")
+streaming_metrics = _try_import("streaming_metrics")
+socials_agent = _try_import("socials_agent")
 
-def _compute_artist_score(
-    artist: str,
-    spotify_stats: Dict[str, Any],
-    youtube_stats: Dict[str, Any],
-) -> Tuple[int, int]:
-    score = 10.0
-    if viking_db and hasattr(viking_db, "get_artist_counts_time_aware"):
-        try:
-            counts = viking_db.get_artist_counts_time_aware(artist)
-            score += min(30.0, float(counts.get("events_30d", 0)) * 5.0)
-            score += min(20.0, float(counts.get("news_30d", 0)) * 4.0)
-        except Exception:
-            pass
+city_boosts = _try_import("city_boosts")
 
-    sp_pop = float(spotify_stats.get("popularity") or 0)
-    sp_followers = float(spotify_stats.get("followers") or 0)
-    yt_subs = float(youtube_stats.get("subscribers") or 0)
-    yt_views = float(youtube_stats.get("views") or 0)
-
-    score += sp_pop * 0.4
-    score += min(20.0, math.log10(sp_followers + 1) * 4.0)
-    score += min(15.0, math.log10(yt_subs + 1) * 3.0)
-    score += min(10.0, math.log10(yt_views + 1) * 2.0)
-
-    score = max(0.0, min(100.0, score))
-    stars = max(1, min(5, int(round(score / 20.0))))
-    return int(round(score)), stars
-
-def _best_cities_for_artist(score: int) -> List[str]:
-    tiers = [
-        ("New York, NY", 95),
-        ("Los Angeles, CA", 95),
-        ("Chicago, IL", 90),
-        ("Dallas, TX", 88),
-        ("Houston, TX", 86),
-        ("Atlanta, GA", 85),
-        ("San Francisco, CA", 85),
-        ("Seattle, WA", 82),
-        ("Boston, MA", 82),
-        ("Philadelphia, PA", 80),
-        ("Miami, FL", 80),
-        ("Denver, CO", 78),
-        ("Phoenix, AZ", 76),
-        ("Minneapolis, MN", 74),
-        ("Detroit, MI", 72),
-        ("Nashville, TN", 72),
-        ("Austin, TX", 70),
-        ("Portland, OR", 70),
-    ]
-    adjusted = []
-    for city, tier in tiers:
-        adjusted.append((city, tier + (score - 50) * 0.2))
-    adjusted.sort(key=lambda x: x[1], reverse=True)
-    return [c for c, _ in adjusted[:8]]
-
-def _city_tier_score(city: str) -> int:
-    city_lower = (city or "").lower()
-    if any(key in city_lower for key in ["new york", "los angeles", "chicago"]):
-        return 95
-    if any(key in city_lower for key in ["dallas", "houston", "atlanta", "san francisco"]):
-        return 85
-    if any(key in city_lower for key in ["seattle", "boston", "philadelphia", "miami"]):
-        return 80
-    return 70
-
-def _sellout_probability(
-    artist_score: int,
-    city_tier: int,
-    capacity: Optional[int],
-    presale_bonus: bool,
-    recent_events_30d: float,
-    news_30d: float,
-) -> int:
-    popularity_bonus = max(0.0, min(100.0, float(artist_score)))
-    base = 0.55 * float(artist_score) + 0.35 * float(city_tier) + 0.10 * popularity_bonus
-
-    if capacity:
-        if capacity < 4000:
-            base += 18
-        elif capacity < 8000:
-            base += 10
-        elif capacity < 12000:
-            base += 6
-        elif capacity < 20000:
-            base += 2
-        else:
-            base -= 4
-
-    if presale_bonus:
-        base += 4
-
-    momentum = min(10.0, float(recent_events_30d) * 2.0 + float(news_30d) * 1.5)
-    base += momentum
-
-    return max(0, min(100, int(round(base))))
-
-def build_artist_intel(artist: str) -> Dict[str, Any]:
-    artist = (artist or "").strip()
-    if not artist:
-        return {}
-    cache = load_cache()
-    key = normalize_artist_key(artist)
-    entry = _cache_get_artist(cache, key)
-    entry["artist_name"] = artist
-    entry["last_used_at"] = time.time()
-
-    urls = _get_cached_urls(entry)
-    if not urls:
-        urls = _discover_profile_links(artist)
-        entry["urls"] = urls
-
-    stats = _get_cached_stats(entry)
-    if not stats:
-        youtube_stats = _fetch_youtube_stats(urls.get("youtube_url", ""))
-        spotify_stats = _fetch_spotify_stats(artist)
-        stats = {
-            "youtube": youtube_stats,
-            "spotify": spotify_stats,
-            "updated_at": time.time(),
-        }
-        entry["stats"] = stats
-
-    spotify_stats = stats.get("spotify", {}) if isinstance(stats, dict) else {}
-    youtube_stats = stats.get("youtube", {}) if isinstance(stats, dict) else {}
-    score, stars = _compute_artist_score(artist, spotify_stats, youtube_stats)
-
-    entry["computed"] = {
-        "score": score,
-        "stars": stars,
-        "best_cities": _best_cities_for_artist(score),
-        "updated_at": time.time(),
-    }
-
-    _cache_set_artist(cache, key, entry)
-    save_cache(cache)
-
-    return {
-        "artist": artist,
-        "urls": urls,
-        "stats": stats,
-        "score": score,
-        "stars": stars,
-        "best_cities": entry["computed"]["best_cities"],
-    }
-
-def _format_stat_number(value: Any) -> str:
-    try:
-        return f"{int(value):,}"
-    except Exception:
-        return "—"
-
-def _format_artist_intel_message(artist: str, intel: Dict[str, Any], events: List[Dict[str, Any]]) -> str:
-    stars = intel.get("stars") or 0
-    score = intel.get("score") or 0
-    urls = intel.get("urls") or {}
-    stats = intel.get("stats") or {}
-    spotify_stats = (stats.get("spotify") or {}) if isinstance(stats, dict) else {}
-    youtube_stats = (stats.get("youtube") or {}) if isinstance(stats, dict) else {}
-
-    lines = [f"🎯 Artist Intel v1.1 — **{artist}**"]
-    lines.append(f"⭐ Stars: {stars} | Score: {score}/100")
-
-    if urls.get("official_site"):
-        lines.append(f"🌐 Official: {urls.get('official_site')}")
-    if urls.get("presale_url"):
-        lines.append(f"🎟️ Presale/Signup: {urls.get('presale_url')}")
-
-    yt_url = urls.get("youtube_url")
-    if yt_url:
-        yt_subs = _format_stat_number(youtube_stats.get("subscribers"))
-        yt_views = _format_stat_number(youtube_stats.get("views"))
-        lines.append(f"▶️ YouTube: {yt_url} (Subs: {yt_subs} | Views: {yt_views})")
-
-    sp_url = spotify_stats.get("spotify_url") or urls.get("spotify_url")
-    if sp_url:
-        sp_followers = _format_stat_number(spotify_stats.get("followers"))
-        sp_pop = spotify_stats.get("popularity")
-        pop_display = f"{sp_pop}" if sp_pop is not None else "—"
-        lines.append(f"🎵 Spotify: {sp_url} (Followers: {sp_followers} | Popularity: {pop_display})")
-
-    tt_url = urls.get("tiktok_url")
-    if tt_url:
-        tt_followers = urls.get("tiktok_followers") or "—"
-        lines.append(f"🎬 TikTok: {tt_url} (Followers: {tt_followers})")
-
-    best_cities = intel.get("best_cities") or []
-    if best_cities:
-        lines.append("🏙️ Best cities: " + ", ".join(best_cities))
-
-    if events:
-        lines.append("🎟️ Top events by sellout probability:")
-        for ev in events[:10]:
-            lines.append(ev.get("line") or "")
-
-    return "\n".join([line for line in lines if line]).strip()[:1900]
-
-def _get_artist_momentum(artist: str) -> Dict[str, float]:
-    if viking_db and hasattr(viking_db, "get_artist_counts_time_aware"):
-        try:
-            counts = viking_db.get_artist_counts_time_aware(artist)
-            return {
-                "events_30d": float(counts.get("events_30d", 0.0)),
-                "news_30d": float(counts.get("news_30d", 0.0)),
-            }
-        except Exception:
-            return {"events_30d": 0.0, "news_30d": 0.0}
-    return {"events_30d": 0.0, "news_30d": 0.0}
-
-def _coerce_capacity(event: Dict[str, Any]) -> Optional[int]:
-    for key in ("capacity", "venue_capacity", "seatmap_capacity"):
-        value = event.get(key)
-        if isinstance(value, (int, float)) and value > 0:
-            return int(value)
-        if isinstance(value, str):
-            match = re.search(r"\d+", value.replace(",", ""))
-            if match:
-                try:
-                    return int(match.group(0))
-                except Exception:
-                    continue
-    return None
-
-def _build_event_lines(
-    artist_score: int,
-    presale_url: str,
-    events: List[Dict[str, Any]],
-    momentum: Dict[str, float],
-) -> List[Dict[str, Any]]:
-    lines: List[Dict[str, Any]] = []
-    recent_events_30d = float(momentum.get("events_30d", 0.0))
-    news_30d = float(momentum.get("news_30d", 0.0))
-    for ev in events:
-        city = ev.get("city") or ""
-        city_tier = _city_tier_score(city)
-        capacity = _coerce_capacity(ev)
-        prob = _sellout_probability(
-            artist_score,
-            city_tier,
-            capacity,
-            bool(presale_url),
-            recent_events_30d,
-            news_30d,
-        )
-        name = ev.get("name") or "Event"
-        date = ev.get("date") or ""
-        venue = ev.get("venue") or ""
-        url = ev.get("url") or ""
-        line = f"• {prob}% — {name} ({date}) {venue} {city}".strip()
-        if url:
-            line += f" — {url}"
-        if presale_url:
-            line += f" | Presale: {presale_url}"
-        lines.append({"prob": prob, "line": line})
-    lines.sort(key=lambda x: x.get("prob", 0), reverse=True)
-    return lines
-
-def _entry_last_updated(entry: Dict[str, Any]) -> float:
-    candidates = []
-    urls = entry.get("urls") if isinstance(entry.get("urls"), dict) else {}
-    stats = entry.get("stats") if isinstance(entry.get("stats"), dict) else {}
-    computed = entry.get("computed") if isinstance(entry.get("computed"), dict) else {}
-    for src in (urls, stats, computed):
-        ts = src.get("updated_at")
-        if ts:
-            candidates.append(float(ts))
-    last_used = entry.get("last_used_at")
-    if last_used:
-        candidates.append(float(last_used))
-    return max(candidates) if candidates else 0.0
-
-def _select_artists_for_refresh_sync(max_artists: int) -> List[Tuple[str, str]]:
-    cache = load_cache()
-    selected: List[str] = []
-    if usage_db:
-        try:
-            recent_keys = usage_db.list_recent_artist_keys(days=7, limit=max_artists)
-        except Exception:
-            recent_keys = []
-        for key in recent_keys:
-            key = normalize_artist_key(key)
-            if not key or key in selected:
-                continue
-            selected.append(key)
-
-    if len(selected) < max_artists:
-        ranked = []
-        for key, entry in cache.items():
-            if key in selected:
-                continue
-            ranked.append((key, _entry_last_updated(entry)))
-        ranked.sort(key=lambda x: x[1], reverse=True)
-        for key, _ts in ranked:
-            selected.append(key)
-            if len(selected) >= max_artists:
-                break
-
-    pairs: List[Tuple[str, str]] = []
-    for key in selected:
-        entry = cache.get(key, {}) if isinstance(cache, dict) else {}
-        name = (entry.get("artist_name") or "").strip()
-        pairs.append((key, name or key))
-    return pairs
-
-def _refresh_artist_intel_sync(artist_key: str, artist_name: str, force: bool = False) -> Dict[str, int]:
-    cache = load_cache()
-    entry = _cache_get_artist(cache, artist_key)
-    name = (artist_name or entry.get("artist_name") or artist_key).strip()
-
-    updated_urls = 0
-    updated_stats = 0
-
-    urls = _get_cached_urls(entry)
-    if force or not urls:
-        urls = _discover_profile_links(name)
-        entry["urls"] = urls
-        updated_urls = 1
-
-    stats = _get_cached_stats(entry)
-    if force or not stats:
-        youtube_stats = _fetch_youtube_stats(urls.get("youtube_url", ""))
-        spotify_stats = _fetch_spotify_stats(name)
-        stats = {
-            "youtube": youtube_stats,
-            "spotify": spotify_stats,
-            "updated_at": time.time(),
-        }
-        entry["stats"] = stats
-        updated_stats = 1
-
-    spotify_stats = stats.get("spotify", {}) if isinstance(stats, dict) else {}
-    youtube_stats = stats.get("youtube", {}) if isinstance(stats, dict) else {}
-    score, stars = _compute_artist_score(name, spotify_stats, youtube_stats)
-
-    entry["computed"] = {
-        "score": score,
-        "stars": stars,
-        "best_cities": _best_cities_for_artist(score),
-        "updated_at": time.time(),
-    }
-    entry["artist_name"] = name
-    entry["last_refreshed_at"] = time.time()
-
-    _cache_set_artist(cache, artist_key, entry)
-    save_cache(cache)
-
-    return {
-        "updated_urls": updated_urls,
-        "updated_stats": updated_stats,
-        "skipped": 1 if not (updated_urls or updated_stats) else 0,
-    }
-
-async def _run_intel_refresh_cycle(force: bool = False) -> Dict[str, Any]:
-    max_artists = max(1, INTEL_REFRESH_MAX_ARTISTS)
-    pairs = await asyncio.to_thread(_select_artists_for_refresh_sync, max_artists)
-    if not pairs:
-        return {"artists_total": 0, "updated_urls": 0, "updated_stats": 0, "skipped": 0}
-
-    sem = asyncio.Semaphore(max(1, INTEL_REFRESH_CONCURRENCY))
-    totals = {"artists_total": len(pairs), "updated_urls": 0, "updated_stats": 0, "skipped": 0}
-
-    async def _worker(key: str, name: str) -> None:
-        async with sem:
-            try:
-                result = await asyncio.to_thread(_refresh_artist_intel_sync, key, name, force)
-                totals["updated_urls"] += result.get("updated_urls", 0)
-                totals["updated_stats"] += result.get("updated_stats", 0)
-                totals["skipped"] += result.get("skipped", 0)
-            except Exception as exc:
-                logger.warning("Intel refresh failed for %s: %s", name, exc)
-
-    await asyncio.gather(*[_worker(key, name) for key, name in pairs])
-    return totals
-
-def _tour_scan_intel_message(item: Dict[str, Any]) -> Optional[str]:
-    title = (item.get("title") or "").strip()
-    link = (item.get("link") or "").strip()
-    artist = title or "Unknown Artist"
-    intel = build_artist_intel(artist)
-    if not intel:
-        return None
-    best_cities = intel.get("best_cities") or []
-    urls = intel.get("urls") or {}
-    lines = [
-        f"🗺️ New tour item: {title}" if title else "🗺️ New tour item",
-        link,
-        f"⭐ Stars: {intel.get('stars')} | Score: {intel.get('score')}/100",
-    ]
-    if best_cities:
-        lines.append("🏙️ Best cities: " + ", ".join(best_cities[:3]))
-    if urls.get("official_site"):
-        lines.append(f"🌐 Official: {urls.get('official_site')}")
-    if urls.get("presale_url"):
-        lines.append(f"🎟️ Presale/Signup: {urls.get('presale_url')}")
-    return "\n".join([l for l in lines if l]).strip()
-
-# --------------------
-# Discord client
-# --------------------
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+# ---------------------------------------------------------------------
+# Discord client + tree
+# ---------------------------------------------------------------------
+INTENTS = discord.Intents.default()
+client = discord.Client(intents=INTENTS)
 tree = app_commands.CommandTree(client)
 
-# Keep references to background tasks to prevent GC
-_bg_tasks: Dict[str, asyncio.Task] = {}
+# Background tasks registry
+TASKS: Dict[str, asyncio.Task] = {}
+
+# Runtime status snapshot
+STATUS: Dict[str, Any] = {
+    "start_unix": START_UNIX,
+    "last_error": None,
+    "sync": {
+        "target": None,
+        "last_sync_unix": None,
+        "last_sync_count": 0,
+        "last_sync_ok": False,
+        "last_sync_error": None,
+    },
+    "monitors": {
+        "price_monitor": bool(price_monitor),
+        "verified_fan_monitor": bool(verified_fan_monitor),
+        "tour_scan_monitor": bool(tour_scan_monitor),
+        "tm_surge_watch": bool(tm_surge_watch and getattr(tm_surge_watch, "is_available", lambda: False)()),
+    },
+    "last_posts": {
+        "price_unix": None,
+        "vf_unix": None,
+        "tour_unix": None,
+        "tm_surge_unix": None,
+    },
+    "tasks": {},
+}
+
+def _safe_truncate(s: str, max_len: int = 1800) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 12] + "\n…(truncated)"
+
+def _uptime_seconds() -> int:
+    return int(time.time() - START_UNIX)
+
+def _rss_mb() -> float:
+    # Linux-only best effort
+    try:
+        import resource
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(rss_kb / 1024.0, 1)
+    except Exception:
+        return 0.0
+
+def _git_rev() -> str:
+    if GIT_REV:
+        return GIT_REV
+    try:
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=os.path.dirname(__file__))
+        return out.decode("utf-8").strip()
+    except Exception:
+        return "unknown"
 
 async def _get_channel(channel_id: int) -> Optional[discord.abc.Messageable]:
     if not channel_id:
         return None
     ch = client.get_channel(channel_id)
-    if ch is None:
-        try:
-            ch = await client.fetch_channel(channel_id)
-        except Exception:
-            return None
-    return ch
-
-async def _send_webhook(
-    webhook_url: Optional[str],
-    content: Optional[str],
-    embeds: Optional[list] = None,
-) -> None:
-    if not webhook_url:
-        return
-    if content is None and not embeds:
-        return
+    if ch:
+        return ch
     try:
-        wh = discord.SyncWebhook.from_url(webhook_url)
-        kwargs = {"content": content or "", "wait": False}
-        if embeds:
-            kwargs["embeds"] = embeds
-        await asyncio.to_thread(wh.send, **kwargs)
+        return await client.fetch_channel(channel_id)
+    except Exception:
+        return None
+
+async def _send_webhook(url: str, content: str) -> None:
+    try:
+        wh = discord.Webhook.from_url(url, client=client)
+        await wh.send(content=content)
     except Exception as e:
         logger.warning("Webhook send failed: %s", e)
 
-async def _send_to_mixed_channel(content: str, prefer: str = "tour") -> None:
+async def post_message(content: str, *, prefer: str = "default") -> None:
     """
-    Prefer sending to an existing configured webhook (TOUR/VF) because those work even if the bot lacks send perms.
-    Fallback to a Discord channel send.
+    prefer: default | price | vf | tour
+    Uses webhook if set, else falls back to channel.
     """
-    if prefer == "tour" and TOUR_SCAN_WEBHOOK_URL:
-        await _send_webhook(TOUR_SCAN_WEBHOOK_URL, content)
+    if prefer == "price" and PRICE_WEBHOOK_URL:
+        await _send_webhook(PRICE_WEBHOOK_URL, content)
         return
     if prefer == "vf" and VERIFIED_FAN_WEBHOOK_URL:
         await _send_webhook(VERIFIED_FAN_WEBHOOK_URL, content)
         return
-    if TOUR_SCAN_WEBHOOK_URL:
+    if prefer == "tour" and TOUR_SCAN_WEBHOOK_URL:
         await _send_webhook(TOUR_SCAN_WEBHOOK_URL, content)
         return
-    if VERIFIED_FAN_WEBHOOK_URL:
-        await _send_webhook(VERIFIED_FAN_WEBHOOK_URL, content)
+
+    target_channel_id = 0
+    if prefer == "price":
+        target_channel_id = PRICE_ALERT_CHANNEL_ID or DEFAULT_CHANNEL_ID
+    elif prefer == "vf":
+        target_channel_id = VERIFIED_FAN_ALERT_CHANNEL_ID or DEFAULT_CHANNEL_ID
+    elif prefer == "tour":
+        target_channel_id = TOUR_SCAN_ALERT_CHANNEL_ID or DEFAULT_CHANNEL_ID
+    else:
+        target_channel_id = (
+            DEFAULT_CHANNEL_ID
+            or PRICE_ALERT_CHANNEL_ID
+            or VERIFIED_FAN_ALERT_CHANNEL_ID
+            or TOUR_SCAN_ALERT_CHANNEL_ID
+        )
+
+    ch = await _get_channel(target_channel_id)
+    if not ch:
+        logger.warning("No channel configured to post message (%s).", prefer)
         return
+    try:
+        await ch.send(content)
+    except Exception as e:
+        logger.warning("Channel send failed: %s", e)
 
-    ch = await _get_channel(PRICE_ALERT_CHANNEL_ID or VERIFIED_FAN_ALERT_CHANNEL_ID or TOUR_SCAN_ALERT_CHANNEL_ID)
-    if ch:
-        try:
-            await ch.send(content)
-        except Exception as e:
-            logger.warning("Channel send failed: %s", e)
+async def _send_ephemeral(interaction: discord.Interaction, content: str) -> None:
+    content = _safe_truncate(content, 1900)
+    if interaction.response.is_done():
+        await interaction.followup.send(content, ephemeral=True)
+    else:
+        await interaction.response.send_message(content, ephemeral=True)
 
+async def _send_to_mixed_channel(content: str, *, prefer: str = "default") -> None:
+    # Wrapper kept in case you later add “mixed routing” logic.
+    await post_message(content, prefer=prefer)
+
+# ---------------------------------------------------------------------
+# Slash command sync logic (guild vs global)
+# ---------------------------------------------------------------------
+async def sync_slash_commands(reason: str = "startup") -> Tuple[bool, str]:
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            tree.copy_global_to(guild=guild)
+            synced = await tree.sync(guild=guild)
+            STATUS["sync"]["target"] = f"guild:{GUILD_ID}"
+        else:
+            synced = await tree.sync()
+            STATUS["sync"]["target"] = "global"
+
+        STATUS["sync"]["last_sync_unix"] = time.time()
+        STATUS["sync"]["last_sync_count"] = len(synced)
+        STATUS["sync"]["last_sync_ok"] = True
+        STATUS["sync"]["last_sync_error"] = None
+        logger.info("Slash commands synced to %s (%s) [%s commands].", STATUS["sync"]["target"], reason, len(synced))
+        return True, f"ok ({len(synced)} commands)"
+    except Exception as e:
+        STATUS["sync"]["last_sync_unix"] = time.time()
+        STATUS["sync"]["last_sync_ok"] = False
+        STATUS["sync"]["last_sync_error"] = str(e)
+        logger.warning("Slash sync failed (%s): %s", reason, e)
+        return False, str(e)
+
+# ---------------------------------------------------------------------
+# Background task guard
+# ---------------------------------------------------------------------
 def _task_guard(name: str, task: asyncio.Task) -> None:
-    def _done(t: asyncio.Task) -> None:
+    TASKS[name] = task
+    STATUS["tasks"][name] = {"created_unix": time.time()}
+
+    def _done_callback(t: asyncio.Task) -> None:
         try:
             exc = t.exception()
+            if exc:
+                STATUS["last_error"] = f"task:{name}: {exc}"
+                logger.warning("Task %s crashed: %s", name, exc)
         except asyncio.CancelledError:
             return
         except Exception as e:
-            STATUS["last_error"] = f"{name}: {e}"
-            return
-        if exc:
-            STATUS["last_error"] = f"{name}: {exc}"
-            logger.exception("Background task crashed: %s", name, exc_info=exc)
-            asyncio.create_task(_send_to_mixed_channel(f"⚠️ {name} crashed: `{exc}`", prefer="tour"))
+            logger.warning("Task %s done callback error: %s", name, e)
 
-    task.add_done_callback(_done)
-    _bg_tasks[name] = task
+    task.add_done_callback(_done_callback)
 
-# --------------------
-# Posting helpers (PRICE / VF)
-# --------------------
-async def post_price_alert(item: Dict[str, Any]) -> None:
-    STATUS["last_price_post_unix"] = time.time()
-    prefix = PRICE_PREFIX or "[PRICE]"
-    try:
-        artist = item.get("artist") or "Unknown Artist"
-        event = item.get("event") or ""
-        url = item.get("url") or ""
-        source = item.get("source") or "secondary"
-        low = item.get("low_price")
-        high = item.get("high_price")
-        baseline = item.get("baseline_price")
-        pct = item.get("pct_change")
-        updated = item.get("as_of") or ""
+# ---------------------------------------------------------------------
+# Price monitor loop (uses price_monitor.poll_prices_once)
+# ---------------------------------------------------------------------
+def _format_price_alert(item: Dict[str, Any]) -> str:
+    title = item.get("title") or item.get("name") or "Price update"
+    url = item.get("url") or ""
+    cur = item.get("current_price") or item.get("price") or ""
+    prev = item.get("previous_price") or ""
+    pct = item.get("pct_change")
 
-        title = f"{prefix} Price change detected"
-        desc_parts = []
-        if event:
-            desc_parts.append(f"**Event:** {event}")
-        desc_parts.append(f"**Artist:** {artist}")
-        desc_parts.append(f"**Source:** {source}")
-        if updated:
-            desc_parts.append(f"**As of:** {updated}")
+    parts = [f"💸 **{title}**"]
+    if cur != "":
+        parts.append(f"Now: `{cur}`")
+    if prev != "":
+        parts.append(f"Was: `{prev}`")
+    if pct is not None:
+        try:
+            parts.append(f"Change: `{float(pct):+.1f}%`")
+        except Exception:
+            parts.append(f"Change: `{pct}`")
+    if url:
+        parts.append(url)
+    return "\n".join(parts)
 
-        embed = discord.Embed(description="\n".join(desc_parts))
-        embed.set_footer(text="Viking AI • price monitor")
+async def _price_monitor_loop() -> None:
+    if not price_monitor or not hasattr(price_monitor, "poll_prices_once"):
+        logger.info("Price monitor not available (price_monitor.poll_prices_once missing).")
+        return
 
-        def money(v: Any) -> str:
-            try:
-                return f"${float(v):,.2f}"
-            except Exception:
-                return "—"
+    logger.info("Price monitor loop started (%ss interval).", PRICE_POLL_SECONDS)
+    while True:
+        try:
+            items = await asyncio.to_thread(price_monitor.poll_prices_once)
+            if items:
+                for it in items:
+                    await post_message(_format_price_alert(it), prefer="price")
+                    STATUS["last_posts"]["price_unix"] = time.time()
+        except Exception as e:
+            STATUS["last_error"] = f"price_monitor: {e}"
+            logger.warning("Price monitor error: %s", e)
+        await asyncio.sleep(max(30, PRICE_POLL_SECONDS))
 
-        if low is not None:
-            embed.add_field(name="Low", value=money(low), inline=True)
-        if high is not None:
-            embed.add_field(name="High", value=money(high), inline=True)
-        if baseline is not None:
-            embed.add_field(name="Baseline", value=money(baseline), inline=True)
-        if pct is not None:
-            try:
-                embed.add_field(name="% Change", value=f"{float(pct):+.2f}%", inline=True)
-            except Exception:
-                pass
-        if url:
-            embed.add_field(name="Link", value=url, inline=False)
-
-        ch = await _get_channel(PRICE_ALERT_CHANNEL_ID) if PRICE_ALERT_CHANNEL_ID else None
-        if ch:
-            await ch.send(content=title, embed=embed)
-        else:
-            await _send_to_mixed_channel(title, prefer="tour")
-            if TOUR_SCAN_WEBHOOK_URL:
-                await _send_webhook(TOUR_SCAN_WEBHOOK_URL, content="", embeds=[embed])
-            elif VERIFIED_FAN_WEBHOOK_URL:
-                await _send_webhook(VERIFIED_FAN_WEBHOOK_URL, content="", embeds=[embed])
-    except Exception as e:
-        logger.warning("post_price_alert failed: %s", e)
-
-async def post_verified_fan_item(item: Dict[str, Any]) -> None:
-    STATUS["last_vf_post_unix"] = time.time()
-    prefix = VERIFIED_FAN_PREFIX or "[VF]"
-    title = (item.get("title") or "Verified Fan update").strip()
-    url = (item.get("url") or "").strip()
-    when = (item.get("published") or item.get("date") or "").strip()
-    src = (item.get("source") or "").strip()
-
-    msg = f"{prefix} {title}"
-    if when:
-        msg += f"\n🕒 {when}"
-    if src:
-        msg += f"\n📰 {src}"
+# ---------------------------------------------------------------------
+# Verified Fan loop (uses verified_fan_monitor.poll_verified_fan_once)
+# ---------------------------------------------------------------------
+async def _post_verified_fan_item(item: Dict[str, Any]) -> None:
+    title = item.get("title") or item.get("name") or "Verified Fan"
+    url = item.get("url") or ""
+    artist = item.get("artist") or ""
+    msg = f"✅ **Verified Fan**: {title}"
+    if artist:
+        msg += f"\nArtist: **{artist}**"
     if url:
         msg += f"\n{url}"
+    await post_message(msg, prefer="vf")
+    STATUS["last_posts"]["vf_unix"] = time.time()
 
-    if VERIFIED_FAN_WEBHOOK_URL:
-        await _send_webhook(VERIFIED_FAN_WEBHOOK_URL, msg)
-    else:
-        ch = await _get_channel(VERIFIED_FAN_ALERT_CHANNEL_ID)
-        if ch:
-            await ch.send(msg)
-        else:
-            await _send_to_mixed_channel(msg, prefer="vf")
-
-# --------------------
-# Background loops
-# --------------------
-async def price_monitor_loop(interval_seconds: int = 900) -> None:
-    if price_monitor is None:
-        logger.info("price_monitor not available; skipping.")
+async def _verified_fan_loop() -> None:
+    if not verified_fan_monitor or not hasattr(verified_fan_monitor, "poll_verified_fan_once"):
+        logger.info("Verified fan monitor not available (verified_fan_monitor.poll_verified_fan_once missing).")
         return
-    logger.info("Price monitor loop started (%ss interval).", interval_seconds)
+
+    logger.info("Verified Fan loop started (%ss interval).", VERIFIED_FAN_POLL_SECONDS)
+
+    def _post(item: Dict[str, Any]) -> None:
+        asyncio.run_coroutine_threadsafe(_post_verified_fan_item(item), client.loop)
+
     while True:
         try:
-            if hasattr(price_monitor, "poll_prices_once"):
-                try:
-                    items = await asyncio.to_thread(price_monitor.poll_prices_once, post_price_alert)
-                except TypeError:
-                    items = await asyncio.to_thread(price_monitor.poll_prices_once)
-                if items:
-                    for item in items or []:
-                        await post_price_alert(item)
-            elif hasattr(price_monitor, "poll_once"):
-                await asyncio.to_thread(price_monitor.poll_once, post_price_alert)
+            # Your module signature supports (post_func, interval_seconds) and loop versions.
+            try:
+                await asyncio.to_thread(verified_fan_monitor.poll_verified_fan_once, _post, VERIFIED_FAN_POLL_SECONDS)
+            except TypeError:
+                await asyncio.to_thread(verified_fan_monitor.poll_verified_fan_once, _post)
         except Exception as e:
-            STATUS["last_error"] = f"price_monitor_loop: {e}"
-            logger.warning("Price monitor tick failed: %s", e)
-        await asyncio.sleep(interval_seconds)
+            STATUS["last_error"] = f"verified_fan: {e}"
+            logger.warning("Verified fan error: %s", e)
+        await asyncio.sleep(max(60, VERIFIED_FAN_POLL_SECONDS))
 
-async def verified_fan_loop() -> None:
-    if verified_fan_monitor is None:
-        logger.info("verified_fan_monitor not available; skipping.")
-        return
-    logger.info("Verified fan polling loop started (async task).")
-    if hasattr(verified_fan_monitor, "start_verified_fan_loop"):
-        await asyncio.to_thread(verified_fan_monitor.start_verified_fan_loop, post_verified_fan_item, VERIFIED_FAN_POLL_SECONDS)
-    elif hasattr(verified_fan_monitor, "start_background_thread"):
-        await asyncio.to_thread(verified_fan_monitor.start_background_thread, post_verified_fan_item, VERIFIED_FAN_POLL_SECONDS)
+# ---------------------------------------------------------------------
+# Tour scan background (uses tour_scan_monitor.start_background_thread)
+# Adds A/B formatting via TOUR_SCAN_MODE=fast|full
+# ---------------------------------------------------------------------
+def _tour_fast_message(item: Dict[str, Any]) -> str:
+    """
+    A) Fast alert (headline + top cities + why, short)
+    """
+    title = (item.get("title") or "New tour announcement").strip()
+    link = (item.get("link") or "").strip()
+
+    # Best-effort: infer artist from title
+    artist_guess = title.split(" - ")[0].strip() if " - " in title else title[:60].strip()
+
+    cities = _best_cities_for_artist(artist_guess, limit=5)
+    why_bits = []
+    if cities:
+        # Use components if available
+        top = cities[0]
+        comp = top.get("components") or {}
+        if comp:
+            why_bits.append(f"signals={list(comp.keys())[:3]}")
+        why_bits.append("high-demand markets")
+    why = " • ".join(why_bits) if why_bits else "best-effort demand signals"
+
+    lines = [f"🎤 **Tour announced**: {title}"]
+    if cities:
+        lines.append("🏙️ Top cities: " + ", ".join([c.get("city") for c in cities if c.get("city")]))
+    lines.append(f"Why: {why}")
+    if link:
+        lines.append(link)
+    return _safe_truncate("\n".join([l for l in lines if l]).strip(), 1800)
+
+def _tour_full_intel_message(item: Dict[str, Any]) -> str:
+    """
+    B) Full intel (includes event list + on-sale placeholders + sellout score)
+    Note: On-sale dates require deeper enrichment (TM details / artist site scraping).
+    """
+    title = (item.get("title") or "New tour announcement").strip()
+    link = (item.get("link") or "").strip()
+    artist_guess = title.split(" - ")[0].strip() if " - " in title else title[:60].strip()
+
+    stars = _stars_for_artist(artist_guess)
+    ranked = _best_cities_for_artist(artist_guess, limit=10)
+    events = _tm_events_for_artist(artist_guess, limit=10)
+
+    lines: List[str] = []
+    lines.append(f"📣 **New tour intel**: {title}")
+    lines.append(f"Artist rating: {_stars_emoji(stars)} ({stars}/5)")
+    if link:
+        lines.append(link)
+
+    lines.append("")
+    lines.append("**Best cities (with reason)**")
+    if ranked:
+        for r in ranked[:7]:
+            city = r.get("city")
+            score = r.get("score")
+            comp = r.get("components") or {}
+            reason = ", ".join(list(comp.keys())[:3]) if comp else "ranking signals"
+            lines.append(f"• {city} (score={score}) — {reason}")
     else:
-        if hasattr(verified_fan_monitor, "_poll_loop"):
-            await asyncio.to_thread(verified_fan_monitor._poll_loop, post_verified_fan_item, VERIFIED_FAN_POLL_SECONDS)
+        lines.append("• (no city ranking available)")
 
-async def health_watchdog() -> None:
-    if STARTUP_NOTIFY:
-        await _send_to_mixed_channel(
-            f"✅ Viking AI online • rev `{_git_rev()}` • PID `{os.getpid()}`",
-            prefer="tour",
-        )
-    while True:
-        try:
-            if HEALTH_PING_SECONDS > 0:
-                logger.debug("health tick uptime=%ss mem=%.1fMB", _uptime_seconds(), _memory_mb())
-        except Exception as e:
-            STATUS["last_error"] = f"health_watchdog: {e}"
-        await asyncio.sleep(max(HEALTH_PING_SECONDS, 30))
+    lines.append("")
+    lines.append("**Events (Ticketmaster best-effort)**")
+    if not events:
+        lines.append("• (no events found / TM module unavailable)")
+    else:
+        for ev in events[:8]:
+            name = ev.get("name") or ev.get("title") or "Event"
+            date = ev.get("date") or ev.get("localDate") or ev.get("start_date") or ""
+            city = ev.get("city") or ev.get("venue_city") or ""
+            venue = ev.get("venue") or ev.get("venue_name") or ""
+            url = ev.get("url") or ""
+            cap = ev.get("capacity") or ev.get("venue_capacity")
 
-async def intel_refresh_loop() -> None:
-    if INTEL_REFRESH_SECONDS <= 0:
-        logger.info("Intel refresh disabled (INTEL_REFRESH_SECONDS=%s).", INTEL_REFRESH_SECONDS)
+            city_score = 1.0
+            if city and ranked:
+                for rr in ranked:
+                    if str(rr.get("city", "")).lower() == str(city).lower():
+                        try:
+                            city_score = float(rr.get("score") or 1.0)
+                        except Exception:
+                            city_score = 1.0
+                        break
+
+            sellout = _sellout_probability(stars, city_score, int(cap) if str(cap).isdigit() else None)
+
+            line = f"• {name} — {date} {city}".strip()
+            line += f" — sellout **{sellout}%**"
+            lines.append(line)
+            if venue:
+                lines.append(f"  Venue: {venue}")
+            if url:
+                lines.append(f"  Tickets: {url}")
+
+    lines.append("")
+    lines.append("**On-sale dates**")
+    lines.append("• Presale: (add enrichment next)")
+    lines.append("• General sale: (add enrichment next)")
+
+    return _safe_truncate("\n".join(lines).strip(), 1900)
+
+def _tour_scan_post_callback(item: Dict[str, Any]) -> str:
+    if TOUR_SCAN_MODE == "full":
+        return _tour_full_intel_message(item)
+    return _tour_fast_message(item)
+
+def _start_tour_scan_monitor() -> None:
+    if not tour_scan_monitor:
+        logger.info("tour_scan_monitor not available.")
         return
-    logger.info(
-        "Intel refresh loop started (%ss interval, max=%s, concurrency=%s).",
-        INTEL_REFRESH_SECONDS,
-        INTEL_REFRESH_MAX_ARTISTS,
-        INTEL_REFRESH_CONCURRENCY,
+
+    fn = getattr(tour_scan_monitor, "start_background_thread", None)
+    if callable(fn):
+        try:
+            fn(
+                interval_seconds=TOUR_SCAN_POLL_SECONDS,
+                post_callback=_tour_scan_post_callback,
+                discord_client=client,
+                channel_id=TOUR_SCAN_ALERT_CHANNEL_ID or DEFAULT_CHANNEL_ID,
+            )
+            logger.info("tour_scan_monitor background thread started (module-managed).")
+            return
+        except TypeError:
+            # legacy signature / dict signature
+            try:
+                fn(
+                    {
+                        "interval_seconds": TOUR_SCAN_POLL_SECONDS,
+                        "post_callback": _tour_scan_post_callback,
+                        "discord_client": client,
+                        "channel_id": TOUR_SCAN_ALERT_CHANNEL_ID or DEFAULT_CHANNEL_ID,
+                    }
+                )
+                logger.info("tour_scan_monitor background thread started (legacy signature).")
+                return
+            except Exception as e:
+                logger.warning("tour_scan_monitor start_background_thread failed: %s", e)
+
+    logger.info("tour_scan_monitor.start_background_thread missing.")
+
+# ---------------------------------------------------------------------
+# Intel v1.0 helpers
+# ---------------------------------------------------------------------
+def _stars_for_artist(artist: str) -> int:
+    if tour_scan_monitor and hasattr(tour_scan_monitor, "rate_artist"):
+        try:
+            v = int(tour_scan_monitor.rate_artist(artist))
+            return max(1, min(v, 5))
+        except Exception:
+            pass
+    return 3  # reasonable default
+
+def _stars_emoji(stars: int) -> str:
+    stars = max(1, min(int(stars), 5))
+    return "⭐" * stars
+
+def _safe_get(d: Dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return None
+
+def _best_cities_for_artist(artist: str, limit: int = 25) -> List[Dict[str, Any]]:
+    """
+    Weighted ranking:
+    - city_boosts.rank_cities() (base + TM density + RSS history)
+    - fallback to tour_scan_monitor.top_cities_for_artist()
+    """
+    if city_boosts and hasattr(city_boosts, "rank_cities"):
+        try:
+            ranked = city_boosts.rank_cities(artist, max_results=limit)
+            if isinstance(ranked, list) and ranked:
+                return ranked
+        except Exception:
+            pass
+
+    # fallback
+    if tour_scan_monitor and hasattr(tour_scan_monitor, "top_cities_for_artist"):
+        try:
+            cities = list(tour_scan_monitor.top_cities_for_artist(artist))
+            out = [{"city": c, "score": 1.0, "components": {"fallback": 1.0}} for c in cities[:limit]]
+            return out
+        except Exception:
+            pass
+
+    return []
+
+def _sellout_probability(artist_stars: int, city_score: float, venue_capacity: Optional[int]) -> int:
+    """
+    Heuristic:
+    - stars (1..5) drives baseline
+    - city_score boosts based on demand signals
+    - capacity reduces sellout likelihood at large venues
+    """
+    stars = max(1, min(int(artist_stars), 5))
+    base = {1: 25, 2: 40, 3: 55, 4: 70, 5: 82}.get(stars, 55)
+
+    # city_score ~ 1.0..(1+weights). normalize softly
+    boost = min(18.0, max(0.0, (float(city_score) - 1.0) * 7.5))
+
+    cap_penalty = 0.0
+    if venue_capacity:
+        try:
+            cap = int(venue_capacity)
+            if cap >= 20000:
+                cap_penalty = 18
+            elif cap >= 15000:
+                cap_penalty = 12
+            elif cap >= 10000:
+                cap_penalty = 7
+            elif cap <= 3500:
+                cap_penalty = -8
+        except Exception:
+            pass
+
+    val = base + boost - cap_penalty
+    return int(max(0, min(100, round(val))))
+
+def _tm_events_for_artist(artist: str, limit: int = 10) -> List[Dict[str, Any]]:
+    if not ticketmaster_agent:
+        return []
+    fn = getattr(ticketmaster_agent, "search_events_for_artist", None)
+    if not callable(fn):
+        return []
+    try:
+        res = fn(artist, limit)
+        return res if isinstance(res, list) else []
+    except Exception:
+        return []
+
+async def _intel_v1(artist: str) -> str:
+    artist = (artist or "").strip()
+    if not artist:
+        return "❌ Provide an artist name."
+
+    # If you have a full engine, prefer it
+    if tour_intel_agent and hasattr(tour_intel_agent, "build_artist_intel"):
+        try:
+            out = await asyncio.to_thread(tour_intel_agent.build_artist_intel, artist)
+            return out if isinstance(out, str) else json.dumps(out, indent=2, default=str)
+        except Exception:
+            pass
+
+    stars = _stars_for_artist(artist)
+    ranked = _best_cities_for_artist(artist, limit=25)
+
+    # Socials / metrics
+    spotify_txt = "unavailable"
+    youtube_txt = "unavailable"
+    tiktok_txt = "unavailable"
+    streaming_txt = "unavailable"
+    socials_heat_txt = "unavailable"
+
+    try:
+        if spotify_agent and hasattr(spotify_agent, "get_spotify_profile"):
+            sp = await asyncio.to_thread(spotify_agent.get_spotify_profile, artist, True)
+            followers = _safe_get(sp, "followers", "followers_total")
+            popularity = _safe_get(sp, "popularity")
+            spotify_txt = f"followers={followers}, popularity={popularity}"
+    except Exception:
+        pass
+
+    try:
+        if youtube_agent and hasattr(youtube_agent, "get_youtube_profile"):
+            yt = await asyncio.to_thread(youtube_agent.get_youtube_profile, artist, True)
+            subs = _safe_get(yt, "subscribers", "subscriberCount")
+            views = _safe_get(yt, "views", "viewCount")
+            youtube_txt = f"subs={subs}, views={views}"
+    except Exception:
+        pass
+
+    try:
+        if tiktok_agent and hasattr(tiktok_agent, "get_tiktok_stats"):
+            tk = await tiktok_agent.get_tiktok_stats(artist)
+            followers = _safe_get(tk, "followers")
+            likes = _safe_get(tk, "likes")
+            tiktok_txt = f"followers={followers}, likes={likes}"
+    except Exception:
+        pass
+
+    try:
+        if streaming_metrics and hasattr(streaming_metrics, "get_spotify_metrics"):
+            sm = await asyncio.to_thread(streaming_metrics.get_spotify_metrics, artist)
+            monthly = _safe_get(sm, "monthly_listeners", "monthlyListeners")
+            streaming_txt = f"monthly_listeners={monthly}"
+    except Exception:
+        pass
+
+    try:
+        if socials_agent and hasattr(socials_agent, "get_socials_heat"):
+            heat = await socials_agent.get_socials_heat(artist)
+            score = _safe_get(heat, "score", "heat_score")
+            socials_heat_txt = f"heat_score={score}"
+    except Exception:
+        pass
+
+    # Events (Ticketmaster)
+    events = _tm_events_for_artist(artist, limit=12)
+
+    # Build output
+    lines: List[str] = []
+    lines.append(f"**{artist} — Intel v1.0**")
+    lines.append(f"Rating: {_stars_emoji(stars)} ({stars}/5)")
+    lines.append("")
+    lines.append("**Social stats (best-effort)**")
+    lines.append(f"• Spotify: {spotify_txt}")
+    lines.append(f"• YouTube: {youtube_txt}")
+    lines.append(f"• TikTok: {tiktok_txt}")
+    lines.append(f"• Streaming: {streaming_txt}")
+    lines.append(f"• Socials heat: {socials_heat_txt}")
+
+    lines.append("")
+    lines.append("**Best demand cities (weighted)**")
+    if ranked:
+        top = ranked[:20]
+        for r in top:
+            lines.append(f"• {r.get('city')} (score={r.get('score')})")
+    else:
+        lines.append("• (no city ranking available)")
+
+    lines.append("")
+    lines.append("**Tour / Events (Ticketmaster best-effort)**")
+    if not events:
+        lines.append("• (no events found / TM module unavailable)")
+    else:
+        for ev in events[:10]:
+            eid = ev.get("id") or ev.get("event_id") or "?"
+            name = ev.get("name") or ev.get("title") or "Event"
+            date = ev.get("date") or ev.get("localDate") or ev.get("start_date") or ""
+            venue = ev.get("venue") or ev.get("venue_name") or ""
+            city = ev.get("city") or ev.get("venue_city") or ""
+            url = ev.get("url") or ""
+            cap = ev.get("capacity") or ev.get("venue_capacity")
+
+            # if city found in ranked list, use score
+            city_score = 1.0
+            if city:
+                for rr in ranked[:30]:
+                    if str(rr.get("city", "")).lower() == str(city).lower():
+                        try:
+                            city_score = float(rr.get("score") or 1.0)
+                        except Exception:
+                            city_score = 1.0
+                        break
+
+            sellout = _sellout_probability(stars, city_score, int(cap) if str(cap).isdigit() else None)
+
+            lines.append(f"• `{eid}` — {name} ({date} {city}) — sellout: **{sellout}%**".strip())
+            if venue:
+                lines.append(f"  Venue: {venue}")
+            if url:
+                lines.append(f"  Tickets: {url}")
+
+    lines.append("")
+    lines.append("**Links (best-effort)**")
+    lines.append("• Official site: (add via Tavily/Google agent enrichment next)")
+    lines.append("• Presales: (add via Tavily/Google agent enrichment next)")
+
+    return _safe_truncate("\n".join(lines), 1900)
+
+# ---------------------------------------------------------------------
+# TM surge watch startup (background loop)
+# ---------------------------------------------------------------------
+async def _start_tm_surge_watch() -> None:
+    if tm_surge_watch is None:
+        logger.info("tm_surge_watch not available; skipping.")
+        return
+    is_avail = getattr(tm_surge_watch, "is_available", None)
+    if callable(is_avail) and not is_avail():
+        logger.info("tm_surge_watch ticketmaster agent unavailable; skipping.")
+        return
+
+    async def _discord_post(msg: str) -> None:
+        await _send_to_mixed_channel(msg, prefer="tour")
+        STATUS["last_posts"]["tm_surge_unix"] = time.time()
+
+    stop_event = asyncio.Event()  # reserved if you later want shutdown support
+    task = asyncio.create_task(
+        tm_surge_watch.surge_watch_loop(discord_post=_discord_post, stop_event=stop_event),
+        name="tm_surge_watch",
     )
-    while True:
-        try:
-            summary = await _run_intel_refresh_cycle(force=False)
-            STATUS["last_intel_refresh_unix"] = time.time()
-            STATUS["last_intel_refresh_summary"] = summary
-        except Exception as e:
-            STATUS["last_error"] = f"intel_refresh_loop: {e}"
-            logger.warning("Intel refresh tick failed: %s", e)
-        await asyncio.sleep(max(300, INTEL_REFRESH_SECONDS))
+    _task_guard("tm_surge_watch", task)
+    logger.info("TM surge watch loop started (%ss).", TM_SURGE_POLL_SECONDS)
 
-def start_tour_scan_monitor() -> None:
-    if tour_scan_monitor is None:
-        logger.info("tour_scan_monitor not available; skipping.")
-        return
+# ---------------------------------------------------------------------
+# Slash commands
+# ---------------------------------------------------------------------
 
-    starter = getattr(tour_scan_monitor, "start_background_thread", None) or getattr(tour_scan_monitor, "start_tour_scan_monitor", None)
-    if not starter:
-        logger.info("tour_scan_monitor present but no start_background_thread()/start_tour_scan_monitor() found; skipping.")
-        return
+@tree.command(name="tour_scan_now", description="Run tour scan immediately (RSS)")
+async def tour_scan_now_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
 
     try:
-        starter(post_callback=_tour_scan_intel_message)
-        logger.info("Tour scan background thread started.")
-    except TypeError:
-        starter(
-            {
-                "post_callback": _tour_scan_intel_message,
-            }
-        )
-        logger.info("Tour scan background thread started.")
+        from tour_scan_monitor import run_once
     except Exception as e:
-        STATUS["last_error"] = f"tour_scan_monitor start: {e}"
-        logger.warning("Failed to start tour_scan_monitor: %s", e)
+        await interaction.followup.send(f"❌ tour_scan_monitor not available: {e}", ephemeral=True)
+        return
 
-# --------------------
-# Slash Commands
-# --------------------
-@tree.command(name="status", description="Show bot status (uptime, memory, monitors).")
-async def status_cmd(interaction: discord.Interaction):
-    start_time = time.monotonic()
-    ok = False
+    loop = asyncio.get_running_loop()
+    stats = await loop.run_in_executor(None, run_once)
+
+    await interaction.followup.send(
+        f"✅ Tour scan completed: feeds={stats.get('feeds',0)} "
+        f"fetched={stats.get('fetched_items',0)} new={stats.get('new_items',0)} "
+        f"errors={stats.get('errors',0)}",
+        ephemeral=True
+    )
+
+@tree.command(name="help", description="Show all Viking AI slash commands (auto-documented).")
+async def help_cmd(interaction: discord.Interaction) -> None:
+    cmds = sorted(tree.get_commands(), key=lambda c: c.name)
+    lines = [
+        "**Viking AI — Slash Commands**",
+        "",
+        "Access: Everyone (no tiers / no admin gating)",
+        "",
+    ]
+    for c in cmds:
+        desc = getattr(c, "description", "") or ""
+        lines.append(f"• `/{c.name}` — {desc}".strip())
+    await _send_ephemeral(interaction, "\n".join(lines))
+
+@tree.command(name="status", description="Status: uptime, memory, monitors + last posts.")
+async def status_cmd(interaction: discord.Interaction) -> None:
+    data = {
+        "rev": _git_rev(),
+        "uptime_seconds": _uptime_seconds(),
+        "memory_rss_mb": _rss_mb(),
+        "monitors": STATUS["monitors"],
+        "intervals_seconds": {
+            "price_monitor": PRICE_POLL_SECONDS,
+            "verified_fan_monitor": VERIFIED_FAN_POLL_SECONDS,
+            "tour_scan_monitor": TOUR_SCAN_POLL_SECONDS,
+            "tm_surge_poll": TM_SURGE_POLL_SECONDS,
+            "intel_refresh": INTEL_REFRESH_SECONDS,
+        },
+        "tour_scan_mode": TOUR_SCAN_MODE,
+        "last_posts": STATUS["last_posts"],
+        "last_error": STATUS.get("last_error"),
+        "pid": os.getpid(),
+    }
+    await _send_ephemeral(interaction, f"```json\n{json.dumps(data, indent=2, default=str)}\n```")
+
+@tree.command(name="health", description="Health JSON dump (ephemeral).")
+async def health_cmd(interaction: discord.Interaction) -> None:
+    data = {
+        "ok": True,
+        "rev": _git_rev(),
+        "uptime_seconds": _uptime_seconds(),
+        "memory_rss_mb": _rss_mb(),
+        "pid": os.getpid(),
+        "sync": STATUS["sync"],
+        "monitors": STATUS["monitors"],
+        "last_posts": STATUS["last_posts"],
+        "last_error": STATUS.get("last_error"),
+    }
+    await _send_ephemeral(interaction, f"```json\n{json.dumps(data, indent=2, default=str)}\n```")
+
+@tree.command(name="debug", description="Debug dump (safe/truncated).")
+async def debug_cmd(interaction: discord.Interaction) -> None:
+    data = {
+        "env": {
+            "GUILD_ID": GUILD_ID,
+            "DEFAULT_CHANNEL_ID": DEFAULT_CHANNEL_ID,
+            "PRICE_ALERT_CHANNEL_ID": PRICE_ALERT_CHANNEL_ID,
+            "VERIFIED_FAN_ALERT_CHANNEL_ID": VERIFIED_FAN_ALERT_CHANNEL_ID,
+            "TOUR_SCAN_ALERT_CHANNEL_ID": TOUR_SCAN_ALERT_CHANNEL_ID,
+            "PRICE_WEBHOOK_URL_set": bool(PRICE_WEBHOOK_URL),
+            "VERIFIED_FAN_WEBHOOK_URL_set": bool(VERIFIED_FAN_WEBHOOK_URL),
+            "TOUR_SCAN_WEBHOOK_URL_set": bool(TOUR_SCAN_WEBHOOK_URL),
+            "TOUR_SCAN_MODE": TOUR_SCAN_MODE,
+        },
+        "sync": STATUS["sync"],
+        "tasks": sorted(TASKS.keys()),
+    }
+    await _send_ephemeral(interaction, f"```json\n{_safe_truncate(json.dumps(data, indent=2, default=str), 1800)}\n```")
+
+@tree.command(name="diag", description="Diagnostics: uptime/memory/app/guild IDs + sync state + registered commands.")
+async def diag_cmd(interaction: discord.Interaction) -> None:
+    app_id = getattr(client.user, "id", None)
+    data = {
+        "rev": _git_rev(),
+        "uptime_seconds": _uptime_seconds(),
+        "memory_mb": _rss_mb(),
+        "application_id": str(app_id) if app_id else "unknown",
+        "guild_id": str(GUILD_ID) if GUILD_ID else "0",
+        "sync_target": STATUS["sync"].get("target"),
+        "registered_commands": ", ".join(sorted([c.name for c in tree.get_commands()])),
+        "last_sync_unix": STATUS["sync"].get("last_sync_unix"),
+        "last_sync_count": STATUS["sync"].get("last_sync_count"),
+        "last_sync_ok": STATUS["sync"].get("last_sync_ok"),
+        "last_sync_error": STATUS["sync"].get("last_sync_error") or "none",
+    }
+    await _send_ephemeral(interaction, "\n".join([f"{k}: {v}" for k, v in data.items()]))
+
+@tree.command(name="sync_now", description="Force re-sync slash commands (guild if GUILD_ID set, else global).")
+async def sync_now_cmd(interaction: discord.Interaction) -> None:
+    ok, msg = await sync_slash_commands(reason="manual:/sync_now")
+    payload = {
+        "ok": ok,
+        "target": STATUS["sync"]["target"],
+        "count": STATUS["sync"]["last_sync_count"],
+        "registered": sorted([c.name for c in tree.get_commands()]),
+        "changed": None,
+        "detail": msg,
+    }
+    await _send_ephemeral(interaction, f"```json\n{json.dumps(payload, indent=2)}\n```")
+
+@tree.command(name="news_now", description="Get latest tour/news intel (best-effort).")
+@app_commands.describe(artist="Optional artist filter")
+async def news_now_cmd(interaction: discord.Interaction, artist: Optional[str] = None) -> None:
+    await interaction.response.defer(thinking=True)
     try:
-        effective_tier = await _get_effective_tier(interaction)
-        data = {
-            "rev": _git_rev(),
-            "uptime_seconds": _uptime_seconds(),
-            "memory_mb": round(_memory_mb(), 1),
-            "monitors": {
-                "price_monitor": bool(price_monitor),
-                "verified_fan_monitor": bool(verified_fan_monitor),
-                "tour_scan_monitor": bool(tour_scan_monitor),
-            },
-            "last_posts": {
-                "price": STATUS.get("last_price_post_unix"),
-                "vf": STATUS.get("last_vf_post_unix"),
-                "tour": STATUS.get("last_tour_post_unix"),
-            },
-            "tiers": {
-                "effective": effective_tier,
-                "default": DEFAULT_TIER,
-                "pro_guilds": len(PRO_GUILD_IDS),
-                "admin_users": len(ADMIN_USER_IDS),
-            },
-            "intel_refresh": {
-                "interval_seconds": INTEL_REFRESH_SECONDS,
-                "max_artists": INTEL_REFRESH_MAX_ARTISTS,
-                "concurrency": INTEL_REFRESH_CONCURRENCY,
-                "last_refresh_unix": STATUS.get("last_intel_refresh_unix"),
-                "last_summary": STATUS.get("last_intel_refresh_summary"),
-            },
-            "last_error": STATUS.get("last_error"),
-        }
-        await interaction.response.send_message(
-            f"```json\n{json.dumps(data, indent=2, default=str)}\n```",
-            ephemeral=True,
-        )
-        ok = True
-    finally:
-        await _record_usage("status", interaction, ok, int((time.monotonic() - start_time) * 1000))
-
-@tree.command(name="health", description="Health JSON dump (config presence + task state).")
-async def health_cmd(interaction: discord.Interaction):
-    start_time = time.monotonic()
-    ok = False
-    try:
-        def task_state(t: Optional[asyncio.Task]) -> Dict[str, Any]:
-            if not t:
-                return {"present": False}
-            return {"present": True, "done": t.done(), "cancelled": t.cancelled(), "name": t.get_name()}
-
-        health = {
-            "rev": _git_rev(),
-            "pid": os.getpid(),
-            "uptime_seconds": _uptime_seconds(),
-            "memory_mb": round(_memory_mb(), 1),
-            "env": {
-                "DISCORD_TOKEN_set": bool(DISCORD_TOKEN),
-                "PRICE_ALERT_CHANNEL_ID": PRICE_ALERT_CHANNEL_ID,
-                "VERIFIED_FAN_ALERT_CHANNEL_ID": VERIFIED_FAN_ALERT_CHANNEL_ID,
-                "TOUR_SCAN_ALERT_CHANNEL_ID": TOUR_SCAN_ALERT_CHANNEL_ID,
-                "VERIFIED_FAN_WEBHOOK_URL_set": bool(VERIFIED_FAN_WEBHOOK_URL),
-                "TOUR_SCAN_WEBHOOK_URL_set": bool(TOUR_SCAN_WEBHOOK_URL),
-                "PRICE_PREFIX": PRICE_PREFIX,
-                "VERIFIED_FAN_PREFIX": VERIFIED_FAN_PREFIX,
-                "TOUR_SCAN_PREFIX": TOUR_SCAN_PREFIX,
-                "INTEL_REFRESH_SECONDS": INTEL_REFRESH_SECONDS,
-                "INTEL_REFRESH_MAX_ARTISTS": INTEL_REFRESH_MAX_ARTISTS,
-            },
-            "tasks": {k: task_state(v) for k, v in _bg_tasks.items()},
-            "last_error": STATUS.get("last_error"),
-        }
-        await interaction.response.send_message(
-            f"```json\n{json.dumps(health, indent=2, default=str)}\n```",
-            ephemeral=True,
-        )
-        ok = True
-    finally:
-        await _record_usage("health", interaction, ok, int((time.monotonic() - start_time) * 1000))
-
-@tree.command(name="debug", description="Quick debug dump (non-sensitive).")
-async def debug_cmd(interaction: discord.Interaction):
-    start_time = time.monotonic()
-    ok = False
-    try:
-        msg = (
-            f"rev `{_git_rev()}` | uptime `{_uptime_seconds()}s` | mem `{_memory_mb():.1f}MB`\n"
-            f"IDs: price={PRICE_ALERT_CHANNEL_ID} vf={VERIFIED_FAN_ALERT_CHANNEL_ID} tour={TOUR_SCAN_ALERT_CHANNEL_ID}\n"
-            f"Webhooks: vf={bool(VERIFIED_FAN_WEBHOOK_URL)} tour={bool(TOUR_SCAN_WEBHOOK_URL)}\n"
-            f"Prefixes: {PRICE_PREFIX} {VERIFIED_FAN_PREFIX} {TOUR_SCAN_PREFIX}\n"
-            f"Token: {_redact(DISCORD_TOKEN)}"
-        )
-        await interaction.response.send_message(msg, ephemeral=True)
-        ok = True
-    finally:
-        await _record_usage("debug", interaction, ok, int((time.monotonic() - start_time) * 1000))
-
-@tree.command(name="diag", description="Slash command diagnostics (sync, env, IDs).")
-async def diag_cmd(interaction: discord.Interaction):
-    start_time = time.monotonic()
-    ok = False
-    try:
-        app_id = getattr(client, "application_id", None)
-        command_names = sorted({c.name for c in tree.get_commands()})
-        lines = [
-            f"rev: {_git_rev()}",
-            f"uptime_seconds: {_uptime_seconds()}",
-            f"memory_mb: {round(_memory_mb(), 1)}",
-            f"application_id: {app_id or 'unknown'}",
-            f"guild_id: {GUILD_ID or 'not set'}",
-            f"sync_target: {SYNC_STATE.get('last_sync_target') or _sync_target()[0]}",
-            f"registered_commands: {', '.join(command_names) or 'none'}",
-            f"last_sync_unix: {SYNC_STATE.get('last_sync_unix')}",
-            f"last_sync_count: {SYNC_STATE.get('last_sync_command_count')}",
-            f"last_sync_ok: {SYNC_STATE.get('last_sync_ok')}",
-            f"last_sync_error: {SYNC_STATE.get('last_sync_error') or 'none'}",
-        ]
-        message = _truncate_text("\n".join(lines))
-        await interaction.response.send_message(message, ephemeral=True)
-        ok = True
-    finally:
-        await _record_usage("diag", interaction, ok, int((time.monotonic() - start_time) * 1000))
-
-@tree.command(name="sync_now", description="Force a slash command sync (ADMIN only).")
-async def sync_now_cmd(interaction: discord.Interaction):
-    start_time = time.monotonic()
-    ok = False
-    try:
-        if not await _require_tier(interaction, "ADMIN"):
+        if tour_news_agent_v3 and hasattr(tour_news_agent_v3, "get_tour_news"):
+            news = await asyncio.to_thread(tour_news_agent_v3.get_tour_news, artist or "")
+            txt = news if isinstance(news, str) else json.dumps(news, indent=2, default=str)
+            await interaction.followup.send(_safe_truncate(txt, 1900), ephemeral=True)
             return
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        result = await _sync_commands("manual")
-        target = result.get("target")
-        count = result.get("count")
-        if result.get("ok"):
-            msg = f"✅ Sync complete ({target}). Commands synced: {count}."
-            await interaction.followup.send(msg, ephemeral=True)
-            ok = True
-        else:
-            err = result.get("error") or "unknown error"
-            await interaction.followup.send(f"⚠️ Sync failed ({target}): {err}", ephemeral=True)
-    finally:
-        await _record_usage("sync_now", interaction, ok, int((time.monotonic() - start_time) * 1000))
+        await interaction.followup.send("❌ News engine not available in this build.", ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"news_now: {e}"
+        await interaction.followup.send(f"❌ news_now failed: {e}", ephemeral=True)
 
-@tree.command(name="news_now", description="Get latest tour news for an artist.")
+@tree.command(name="intel", description="Intel v1.0: stars + socials + best cities + sellout probabilities + links (best-effort).")
 @app_commands.describe(artist="Artist name")
-async def news_now_cmd(interaction: discord.Interaction, artist: str):
-    start_time = time.monotonic()
-    ok = False
-    extra = {"artist": artist, "artist_key": normalize_artist_key(artist)}
+async def intel_cmd(interaction: discord.Interaction, artist: str) -> None:
+    await interaction.response.defer(thinking=True)
     try:
-        if not await _require_tier(interaction, "PRO"):
-            return
-        await interaction.response.defer(thinking=True)
-        if not get_tour_news:
-            await interaction.followup.send("Tour news agent not available.")
-            return
-        try:
-            text = await asyncio.to_thread(get_tour_news, artist)
-            await interaction.followup.send(text[:1900])
-            ok = True
-        except Exception as e:
-            await interaction.followup.send(f"Error: {e}")
-    finally:
-        await _record_usage("news_now", interaction, ok, int((time.monotonic() - start_time) * 1000), extra)
+        txt = await _intel_v1(artist)
+        await interaction.followup.send(_safe_truncate(txt, 1900), ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"intel: {e}"
+        await interaction.followup.send(f"❌ intel failed: {e}", ephemeral=True)
 
-@tree.command(name="events", description="Search Ticketmaster events for an artist.")
-@app_commands.describe(artist="Artist name")
-async def events_cmd(interaction: discord.Interaction, artist: str):
-    start_time = time.monotonic()
-    ok = False
-    extra = {"artist": artist, "artist_key": normalize_artist_key(artist)}
+@tree.command(name="intel_refresh", description="Refresh intel caches (best-effort).")
+async def intel_refresh_cmd(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True)
     try:
-        if not await _require_tier(interaction, "PRO"):
-            return
-        await interaction.response.defer(thinking=True)
-        if not search_events_for_artist:
-            await interaction.followup.send("Ticketmaster search not available.")
-            return
-        try:
-            results = await asyncio.to_thread(search_events_for_artist, artist)
-            if not results:
-                await interaction.followup.send("No events found.")
-                return
-            lines = []
-            for e in results[:10]:
-                eid = e.get("id") or e.get("event_id") or "?"
-                name = e.get("name") or e.get("title") or "Event"
-                date = e.get("date") or e.get("localDate") or ""
-                venue = e.get("venue") or ""
-                lines.append(f"• `{eid}` — {name} ({date}) {venue}".strip())
-            await interaction.followup.send("\n".join(lines)[:1900])
-            ok = True
-        except Exception as e:
-            await interaction.followup.send(f"Error: {e}")
-    finally:
-        await _record_usage("events", interaction, ok, int((time.monotonic() - start_time) * 1000), extra)
+        # best-effort cache refresh hook if you add it later
+        if tour_intel_agent and hasattr(tour_intel_agent, "refresh_intel_caches"):
+            await asyncio.to_thread(tour_intel_agent.refresh_intel_caches)
+        await interaction.followup.send("✅ Intel refresh done (best-effort).", ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"intel_refresh: {e}"
+        await interaction.followup.send(f"❌ intel_refresh failed: {e}", ephemeral=True)
 
-@tree.command(name="intel", description="Artist Intel v1.1 (links, stats, routing, sellout odds).")
-@app_commands.describe(artist="Artist name")
-async def intel_cmd(interaction: discord.Interaction, artist: str):
-    start_time = time.monotonic()
-    ok = False
-    extra = {"artist": artist, "artist_key": normalize_artist_key(artist)}
+@tree.command(name="events", description="Search Ticketmaster events by artist name.")
+@app_commands.describe(artist="Artist name", limit="Max results (default 10)")
+async def events_cmd(interaction: discord.Interaction, artist: str, limit: Optional[int] = 10) -> None:
+    await interaction.response.defer(thinking=True)
+    if not ticketmaster_agent or not hasattr(ticketmaster_agent, "search_events_for_artist"):
+        await interaction.followup.send("❌ Ticketmaster search not available in this build.", ephemeral=True)
+        return
     try:
-        if not await _require_tier(interaction, "PRO"):
+        limit_int = max(1, min(int(limit or 10), 25))
+        res = await asyncio.to_thread(ticketmaster_agent.search_events_for_artist, artist, limit_int)
+        if not res:
+            await interaction.followup.send("No events found.", ephemeral=True)
             return
-        await interaction.response.defer(thinking=True)
-        try:
-            intel = await asyncio.to_thread(build_artist_intel, artist)
-            events: List[Dict[str, Any]] = []
-            if search_events_for_artist:
-                events = await asyncio.to_thread(search_events_for_artist, artist, 15)
-            presale_url = (intel.get("urls") or {}).get("presale_url") or ""
-            momentum = _get_artist_momentum(artist)
-            event_lines = _build_event_lines(int(intel.get("score") or 0), presale_url, events, momentum)
-            message = _format_artist_intel_message(artist, intel, event_lines)
-            await interaction.followup.send(message or "No intel available yet.")
-            ok = True
-        except Exception as e:
-            await interaction.followup.send(f"Error: {e}")
-    finally:
-        await _record_usage("intel", interaction, ok, int((time.monotonic() - start_time) * 1000), extra)
+        lines = [f"**Ticketmaster events for _{artist}_**"]
+        for ev in res[:limit_int]:
+            name = ev.get("name") or ev.get("title") or "Event"
+            eid = ev.get("id") or ev.get("event_id") or ""
+            date = ev.get("date") or ev.get("localDate") or ev.get("start_date") or ""
+            city = ev.get("city") or ev.get("venue_city") or ""
+            url = ev.get("url") or ""
+            line = f"• `{eid}` — **{name}**"
+            if date or city:
+                line += f" ({date} {city})".strip()
+            if url:
+                line += f"\n  {url}"
+            lines.append(line)
+        await interaction.followup.send(_safe_truncate("\n".join(lines), 1900), ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"events: {e}"
+        await interaction.followup.send(f"❌ events failed: {e}", ephemeral=True)
 
-@tree.command(name="eventdetails", description="Get Ticketmaster event details by id.")
+@tree.command(name="eventdetails", description="Get details for a Ticketmaster event id.")
 @app_commands.describe(event_id="Ticketmaster event id")
-async def eventdetails_cmd(interaction: discord.Interaction, event_id: str):
-    start_time = time.monotonic()
-    ok = False
-    extra = {"event_id": event_id}
+async def eventdetails_cmd(interaction: discord.Interaction, event_id: str) -> None:
+    await interaction.response.defer(thinking=True)
+    if not ticketmaster_agent:
+        await interaction.followup.send("❌ Ticketmaster not available in this build.", ephemeral=True)
+        return
+    getter = getattr(ticketmaster_agent, "get_event_details", None) or getattr(ticketmaster_agent, "event_details", None)
+    if not callable(getter):
+        await interaction.followup.send("❌ Ticketmaster event details not available in this build.", ephemeral=True)
+        return
     try:
-        if not await _require_tier(interaction, "PRO"):
-            return
-        await interaction.response.defer(thinking=True)
-        if not get_event_details:
-            await interaction.followup.send("Ticketmaster details not available.")
-            return
-        try:
-            d = await asyncio.to_thread(get_event_details, event_id)
-            if not d:
-                await interaction.followup.send("No details found.")
-                return
-            await interaction.followup.send(f"```json\n{json.dumps(d, indent=2, default=str)[:1900]}\n```")
-            ok = True
-        except Exception as e:
-            await interaction.followup.send(f"Error: {e}")
-    finally:
-        await _record_usage("eventdetails", interaction, ok, int((time.monotonic() - start_time) * 1000), extra)
+        ev = await asyncio.to_thread(getter, event_id)
+        txt = json.dumps(ev, indent=2, default=str)
+        await interaction.followup.send(f"```json\n{_safe_truncate(txt, 1900)}\n```", ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"eventdetails: {e}"
+        await interaction.followup.send(f"❌ eventdetails failed: {e}", ephemeral=True)
 
-@tree.command(name="intel_refresh", description="Force a refresh cycle for artist intel (ADMIN only).")
-async def intel_refresh_cmd(interaction: discord.Interaction):
-    start_time = time.monotonic()
-    ok = False
+@tree.command(name="city_debug", description="Explain weighted city ranking components for an artist.")
+@app_commands.describe(artist="Artist name")
+async def city_debug_cmd(interaction: discord.Interaction, artist: str) -> None:
+    ranked = _best_cities_for_artist(artist, limit=25)
+    if not ranked:
+        await _send_ephemeral(interaction, "No city ranking available.")
+        return
+    lines = [f"**City ranking debug — {artist}**", ""]
+    for r in ranked[:20]:
+        city = r.get("city")
+        score = r.get("score")
+        comp = r.get("components") or {}
+        lines.append(f"• {city} score={score} components={comp}")
+    await _send_ephemeral(interaction, _safe_truncate("\n".join(lines), 1900))
+
+# ---------------------------------------------------------------------
+# Surge watch slash commands
+# ---------------------------------------------------------------------
+@tree.command(name="surge_add", description="Enable Ticketmaster surge watch for an artist.")
+@app_commands.describe(artist="Artist name", days="Number of days to watch (default 5)")
+async def surge_add_cmd(interaction: discord.Interaction, artist: str, days: Optional[int] = 5) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if tm_surge_watch is None or not getattr(tm_surge_watch, "add_surge_artist", None):
+        await interaction.followup.send("❌ Surge watch not available in this build.", ephemeral=True)
+        return
     try:
-        if not await _require_tier(interaction, "ADMIN"):
-            return
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        summary = await _run_intel_refresh_cycle(force=True)
-        STATUS["last_intel_refresh_unix"] = time.time()
-        STATUS["last_intel_refresh_summary"] = summary
-        msg = (
-            "✅ Intel refresh complete.\n"
-            f"Artists: {summary.get('artists_total', 0)} | "
-            f"URLs updated: {summary.get('updated_urls', 0)} | "
-            f"Stats updated: {summary.get('updated_stats', 0)} | "
-            f"Skipped: {summary.get('skipped', 0)}"
-        )
-        await interaction.followup.send(msg, ephemeral=True)
-        ok = True
-    finally:
-        await _record_usage("intel_refresh", interaction, ok, int((time.monotonic() - start_time) * 1000))
+        ok, msg = await asyncio.to_thread(tm_surge_watch.add_surge_artist, artist, int(days or 5))
+        await interaction.followup.send(("✅ " if ok else "❌ ") + msg.replace("✅ ", "").replace("❌ ", ""), ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"surge_add: {e}"
+        await interaction.followup.send(f"❌ surge_add failed: {e}", ephemeral=True)
 
-# --------------------
+@tree.command(name="surge_list", description="List active Ticketmaster surge watch artists.")
+async def surge_list_cmd(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if tm_surge_watch is None or not getattr(tm_surge_watch, "list_surge_artists", None):
+        await interaction.followup.send("❌ Surge watch not available in this build.", ephemeral=True)
+        return
+    try:
+        rows = await asyncio.to_thread(tm_surge_watch.list_surge_artists)
+        if not rows:
+            await interaction.followup.send("No surge artists enabled.", ephemeral=True)
+            return
+        lines = ["**Active surge artists**"]
+        now = time.time()
+        for r in rows[:25]:
+            artist = r.get("artist")
+            expires = float(r.get("expires_at_unix") or 0)
+            hrs = max(0, int((expires - now) / 3600))
+            lines.append(f"• {artist} — expires in ~{hrs}h")
+        await interaction.followup.send(_safe_truncate("\n".join(lines), 1900), ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"surge_list: {e}"
+        await interaction.followup.send(f"❌ surge_list failed: {e}", ephemeral=True)
+
+@tree.command(name="surge_remove", description="Disable Ticketmaster surge watch for an artist.")
+@app_commands.describe(artist="Artist name")
+async def surge_remove_cmd(interaction: discord.Interaction, artist: str) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if tm_surge_watch is None or not getattr(tm_surge_watch, "remove_surge_artist", None):
+        await interaction.followup.send("❌ Surge watch not available in this build.", ephemeral=True)
+        return
+    try:
+        ok, msg = await asyncio.to_thread(tm_surge_watch.remove_surge_artist, artist)
+        await interaction.followup.send(("✅ " if ok else "❌ ") + msg.replace("✅ ", "").replace("❌ ", ""), ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"surge_remove: {e}"
+        await interaction.followup.send(f"❌ surge_remove failed: {e}", ephemeral=True)
+
+# ---------------------------------------------------------------------
 # Lifecycle
-# --------------------
+# ---------------------------------------------------------------------
 @client.event
-async def on_ready():
-    await _sync_commands("startup")
-
+async def on_ready() -> None:
+    logger.info("Starting Viking AI…")
+    await sync_slash_commands(reason="startup")
     logger.info("Logged in as %s", client.user)
 
-    # Start monitors
-    start_tour_scan_monitor()
+    # Tour scan (thread managed by module if available)
+    _start_tour_scan_monitor()
 
-    t1 = asyncio.create_task(verified_fan_loop(), name="verified_fan_loop")
-    _task_guard("verified_fan_loop", t1)
+    # Start surge watch loop (async)
+    await _start_tm_surge_watch()
 
-    t2 = asyncio.create_task(price_monitor_loop(interval_seconds=900), name="price_monitor_loop")
-    _task_guard("price_monitor_loop", t2)
+    # Async monitor loops
+    t_vf = asyncio.create_task(_verified_fan_loop(), name="verified_fan_loop")
+    _task_guard("verified_fan_loop", t_vf)
 
-    t3 = asyncio.create_task(health_watchdog(), name="health_watchdog")
-    _task_guard("health_watchdog", t3)
+    t_price = asyncio.create_task(_price_monitor_loop(), name="price_monitor_loop")
+    _task_guard("price_monitor_loop", t_price)
 
-    t4 = asyncio.create_task(intel_refresh_loop(), name="intel_refresh_loop")
-    _task_guard("intel_refresh_loop", t4)
-
-# --------------------
-# Entrypoint
-# --------------------
-def main():
-    if not DISCORD_TOKEN:
-        raise SystemExit("DISCORD_TOKEN is not set.")
+def main() -> None:
     client.run(DISCORD_TOKEN)
 
 if __name__ == "__main__":

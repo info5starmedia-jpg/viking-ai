@@ -302,7 +302,6 @@ def main():
     # New LLM + integrations key set:
     required_keys = [
         # LLM stack
-        "OPENROUTER_API_KEY",   # main GPT-style router
         "GEMINI_API_KEY",       # or GOOGLE_API_KEY / GOOGLE_GEMINI_API_KEY used in diagnostics
         "TAVILY_API_KEY",
 

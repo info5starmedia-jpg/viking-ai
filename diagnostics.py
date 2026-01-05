@@ -12,7 +12,6 @@ def run_diagnostics():
 
     LLM-related:
       - Gemini
-      - OpenRouter
       - OpenAI (legacy / optional)
       - Tavily
 
@@ -33,10 +32,6 @@ def run_diagnostics():
         or os.getenv("GOOGLE_GEMINI_API_KEY")
     )
     results["Gemini"] = bool(gemini_key and len(gemini_key) > 10)
-
-    # OpenRouter (main gateway for OpenAI-style models)
-    openrouter_key = os.getenv("OPENROUTER_API_KEY")
-    results["OpenRouter"] = bool(openrouter_key and len(openrouter_key) > 10)
 
     # OpenAI (legacy / optional)
     openai_key = os.getenv("OPENAI_API_KEY")
@@ -83,16 +78,14 @@ def format_llm_status(results: dict) -> str:
     Helper for status messages, so everything uses the same wording.
     """
     gemini_ok = results.get("Gemini", False)
-    or_ok = results.get("OpenRouter", False)
     tavily_ok = results.get("Tavily", False)
 
     parts = [
         f"Gemini: {'✅' if gemini_ok else '⚠️'}",
-        f"OpenRouter: {'✅' if or_ok else '⚠️'}",
         f"Tavily: {'✅' if tavily_ok else '⚠️'}",
     ]
 
-    overall_ok = gemini_ok or or_ok
+    overall_ok = gemini_ok
     prefix = "✅ Ready" if overall_ok else "⚠️ Not fully configured"
     return f"{prefix} ({' / '.join(parts)})"
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Viking AI RSS Test Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/viking-ai
+EnvironmentFile=/opt/viking-ai/.env
+ExecStart=/opt/viking-ai/.venv/bin/python -u /opt/viking-ai/rss_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

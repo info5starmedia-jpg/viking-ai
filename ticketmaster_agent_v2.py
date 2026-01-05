@@ -1,21 +1,25 @@
 """
-Compat shim for older/newer code paths.
+Compatibility shim for Ticketmaster (v2).
 
-Some parts of Viking AI (bot.py) import:
-  from ticketmaster_agent_v2 import search_events_for_artist, get_event_details
+This file exists ONLY so older code importing
+`ticketmaster_agent_v2` continues to work.
 
-Your repo currently ships ticketmaster_agent.py, so this module simply re-exports
-the needed functions from there (or provides safe fallbacks).
+The canonical implementation lives in:
+    ticketmaster_agent.py
 """
 
-from __future__ import annotations
+from typing import Any, Dict, List
 
-# Prefer the "real" module you already have
-try:
-    from ticketmaster_agent import search_events_for_artist, get_event_details  # type: ignore
-except Exception:
-    # Fallbacks (in case names differ in your repo)
-    from ticketmaster_agent import fetch_events_for_artist as search_events_for_artist  # type: ignore
-    from ticketmaster_agent import fetch_event_details as get_event_details  # type: ignore
+__all__ = ["search_events_for_artist", "get_event_details", "fetch_verified_fan_programs"]
 
-__all__ = ["search_events_for_artist", "get_event_details"]
+def search_events_for_artist(artist: str, *args, **kwargs) -> List[Dict[str, Any]]:
+    import ticketmaster_agent as tm
+    return tm.search_events_for_artist(artist, *args, **kwargs)
+
+def get_event_details(event_id: str, *args, **kwargs) -> Dict[str, Any]:
+    import ticketmaster_agent as tm
+    return tm.get_event_details(event_id, *args, **kwargs)
+
+def fetch_verified_fan_programs(*args, **kwargs) -> List[Dict[str, Any]]:
+    import ticketmaster_agent as tm
+    return tm.fetch_verified_fan_programs(*args, **kwargs)
