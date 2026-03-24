@@ -70,6 +70,11 @@ except Exception:
     _get_live_seatmap = None  # type: ignore
     _summarize_inventory = None  # type: ignore
 
+try:
+    from arbitrage_agent import analyze_arbitrage as _analyze_arbitrage  # type: ignore
+except Exception:
+    _analyze_arbitrage = None  # type: ignore
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -316,10 +321,59 @@ async def _enrich_with_seatmap(event_id: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Arbitrage estimation
+# ---------------------------------------------------------------------------
+
+def _estimate_resale_floor(face_min: float, sell_through_pct: float = 0.0) -> float:
+    """
+    Heuristic resale floor estimate based on face price and demand signals.
+    Uses sell-through % from seatmap intel when available.
+    """
+    if sell_through_pct >= 90:
+        multiplier = 2.0   # very hot show
+    elif sell_through_pct >= 75:
+        multiplier = 1.6
+    elif sell_through_pct >= 60:
+        multiplier = 1.4
+    else:
+        multiplier = 1.3   # baseline average
+    return face_min * multiplier
+
+
+def _arbitrage_line(face_min: float, sell_through_pct: float = 0.0) -> Optional[str]:
+    """
+    Return a one-line arbitrage summary string, or None if unavailable.
+    Uses arbitrage_agent.analyze_arbitrage with an estimated resale floor.
+    """
+    if _analyze_arbitrage is None or face_min <= 0:
+        return None
+    try:
+        resale_floor = _estimate_resale_floor(face_min, sell_through_pct)
+        result = _analyze_arbitrage(
+            face_floor=face_min,
+            resale_floor=resale_floor,
+            primary_fees_pct=0.15,   # ~15% TM fees
+            resale_fees_pct=0.10,    # ~10% resale platform fees
+        )
+        return (
+            f"Arbitrage: {result.rating} "
+            f"(face~${result.face_floor:.0f} → resale~${result.resale_floor:.0f}, "
+            f"x{result.factor:.2f}, +${result.spread:.0f})"
+        )
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Alert formatters
 # ---------------------------------------------------------------------------
 
-def _format_drop_alert(row: Dict[str, Any], new_status: str, seatmap_txt: Optional[str] = None) -> str:
+def _format_drop_alert(
+    row: Dict[str, Any],
+    new_status: str,
+    seatmap_txt: Optional[str] = None,
+    sell_through_pct: float = 0.0,
+) -> str:
     event_id = row.get("event_id") or row.get("id") or "?"
     name = row.get("name") or f"Event {event_id}"
     artist = row.get("artist") or row.get("artist_label") or ""
@@ -338,6 +392,9 @@ def _format_drop_alert(row: Dict[str, Any], new_status: str, seatmap_txt: Option
         parts.append(f"When/Where: {loc}")
     if price_min is not None and price_max is not None:
         parts.append(f"Price: `${price_min:.0f}` – `${price_max:.0f}`")
+        arb = _arbitrage_line(float(price_min), sell_through_pct)
+        if arb:
+            parts.append(arb)
     parts.append(f"Status: `{old_status}` → `{new_status}`")
     parts.append(f"Event ID: `{event_id}`")
     if seatmap_txt:
@@ -675,6 +732,21 @@ async def drop_watch_loop(
             slept += chunk
 
 
+def _parse_sell_through(seatmap_txt: Optional[str]) -> float:
+    """Extract sell-through % from seatmap enrichment text, or return 0."""
+    if not seatmap_txt:
+        return 0.0
+    try:
+        import re
+        m = re.search(r"(\d+(?:\.\d+)?)%\s+open", seatmap_txt)
+        if m:
+            open_pct = float(m.group(1))
+            return max(0.0, 100.0 - open_pct)
+    except Exception:
+        pass
+    return 0.0
+
+
 async def _poll_watched_events(discord_post: Callable[[str], Awaitable[None]]) -> None:
     """Track 1: check each individually-registered event ID."""
     now = time.time()
@@ -721,8 +793,9 @@ async def _poll_watched_events(discord_post: Callable[[str], Awaitable[None]]) -
             conn.commit()
 
         if _is_dropped(old_status, new_status):
-            # Try seatmap enrichment
+            # Try seatmap enrichment — also extracts sell_through for arbitrage
             seatmap_txt = await _enrich_with_seatmap(event_id)
+            sell_through = _parse_sell_through(seatmap_txt)
 
             enriched_row = {
                 **row,
@@ -734,7 +807,7 @@ async def _poll_watched_events(discord_post: Callable[[str], Awaitable[None]]) -
                 "price_min": new_price_min,
                 "price_max": new_price_max,
             }
-            alert = _format_drop_alert(enriched_row, new_status, seatmap_txt)
+            alert = _format_drop_alert(enriched_row, new_status, seatmap_txt, sell_through)
             logger.info(
                 "drop_catcher: DROP event_id=%s (%s → %s)", event_id, old_status, new_status
             )

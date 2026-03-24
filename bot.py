@@ -94,6 +94,7 @@ verified_fan_monitor = _try_import("verified_fan_monitor")
 tour_scan_monitor = _try_import("tour_scan_monitor")
 tm_surge_watch = _try_import("tm_surge_watch")
 drop_catcher = _try_import("drop_catcher")
+usage_db = _try_import("usage_db")
 
 ticketmaster_agent = _try_import("ticketmaster_agent")
 tour_news_agent_v3 = _try_import("tour_news_agent_v3")
@@ -173,6 +174,51 @@ def _git_rev() -> str:
         return out.decode("utf-8").strip()
     except Exception:
         return "unknown"
+
+# ---------------------------------------------------------------------
+# Tier gating
+# Tiers: FREE < PRO < ELITE
+# Default (no row in guild_tiers): PRO — open access during beta
+# ---------------------------------------------------------------------
+_TIER_ORDER = {"FREE": 0, "PRO": 1, "ELITE": 2}
+_DEFAULT_TIER = "PRO"
+
+
+def _get_guild_tier(guild_id: Optional[int]) -> str:
+    if not guild_id or not usage_db:
+        return _DEFAULT_TIER
+    try:
+        override = usage_db.get_guild_tier_override(str(guild_id))
+        return override if override in _TIER_ORDER else _DEFAULT_TIER
+    except Exception:
+        return _DEFAULT_TIER
+
+
+async def _tier_gate(interaction: discord.Interaction, required: str) -> bool:
+    """
+    Returns True if the guild meets the required tier. Sends an ephemeral
+    denial and returns False if not.
+
+    Usage:
+        if not await _tier_gate(interaction, "PRO"):
+            return
+    """
+    guild_id = interaction.guild_id
+    current = _get_guild_tier(guild_id)
+    current_rank = _TIER_ORDER.get(current, 1)
+    required_rank = _TIER_ORDER.get(required.upper(), 1)
+
+    if current_rank >= required_rank:
+        return True
+
+    msg = (
+        f"🔒 This command requires **{required}** tier "
+        f"(your server is on **{current}**). "
+        f"Contact the admin to upgrade."
+    )
+    await _send_ephemeral(interaction, msg)
+    return False
+
 
 async def _get_channel(channel_id: int) -> Optional[discord.abc.Messageable]:
     if not channel_id:
@@ -1019,6 +1065,8 @@ async def city_debug_cmd(interaction: discord.Interaction, artist: str) -> None:
 @app_commands.describe(event_id="Ticketmaster event ID", artist="Artist name (optional label)", days="Days to watch (default 7)")
 async def drop_add_cmd(interaction: discord.Interaction, event_id: str, artist: Optional[str] = "", days: Optional[int] = 7) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
+    if not await _tier_gate(interaction, "PRO"):
+        return
     if drop_catcher is None or not getattr(drop_catcher, "add_drop_watch", None):
         await interaction.followup.send("❌ Drop catcher not available in this build.", ephemeral=True)
         return
@@ -1063,6 +1111,8 @@ async def drop_list_cmd(interaction: discord.Interaction) -> None:
 @app_commands.describe(event_id="Ticketmaster event ID to stop watching")
 async def drop_remove_cmd(interaction: discord.Interaction, event_id: str) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
+    if not await _tier_gate(interaction, "PRO"):
+        return
     if drop_catcher is None or not getattr(drop_catcher, "remove_drop_watch", None):
         await interaction.followup.send("❌ Drop catcher not available in this build.", ephemeral=True)
         return
@@ -1074,10 +1124,59 @@ async def drop_remove_cmd(interaction: discord.Interaction, event_id: str) -> No
         await interaction.followup.send(f"❌ drop_remove failed: {e}", ephemeral=True)
 
 
+@tree.command(name="drop_search", description="Search Ticketmaster events by artist then watch one for drops.")
+@app_commands.describe(artist="Artist name to search", limit="Max results (default 8)")
+async def drop_search_cmd(interaction: discord.Interaction, artist: str, limit: Optional[int] = 8) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if not await _tier_gate(interaction, "PRO"):
+        return
+    if not ticketmaster_agent or not hasattr(ticketmaster_agent, "search_events_for_artist"):
+        await interaction.followup.send("❌ Ticketmaster not available in this build.", ephemeral=True)
+        return
+    try:
+        limit_int = max(1, min(int(limit or 8), 15))
+        events = await asyncio.to_thread(ticketmaster_agent.search_events_for_artist, artist, limit_int)
+        if not events:
+            await interaction.followup.send(f"No events found for **{artist}**.", ephemeral=True)
+            return
+
+        lines = [f"**Events for _{artist}_** — use `/drop_add <event_id>` to watch one:"]
+        for ev in events[:limit_int]:
+            eid = ev.get("id") or ev.get("event_id") or "?"
+            name = ev.get("name") or "Event"
+            date = ev.get("dates", {}).get("start", {}).get("localDate") or ev.get("date") or ""
+            venues = (ev.get("_embedded") or {}).get("venues") or [{}]
+            city = (venues[0].get("city") or {}).get("name") or ev.get("city") or ""
+            status = (ev.get("dates") or {}).get("status", {}).get("code") or "unknown"
+            price_ranges = ev.get("priceRanges") or []
+            price_str = ""
+            if price_ranges:
+                try:
+                    pmin = min(p.get("min", 0) for p in price_ranges if p.get("min") is not None)
+                    pmax = max(p.get("max", 0) for p in price_ranges if p.get("max") is not None)
+                    price_str = f" `${pmin:.0f}–${pmax:.0f}`"
+                except Exception:
+                    pass
+            line = f"• `{eid}` — **{name}**"
+            if date or city:
+                line += f" ({date} {city})".strip()
+            line += f" status=`{status}`{price_str}"
+            lines.append(line)
+
+        lines.append("")
+        lines.append("Use `/drop_add <event_id>` to start watching an event for drops.")
+        await interaction.followup.send(_safe_truncate("\n".join(lines), 1900), ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"drop_search: {e}"
+        await interaction.followup.send(f"❌ drop_search failed: {e}", ephemeral=True)
+
+
 @tree.command(name="drop_changes", description="Scan Ticketmaster now for music events that just went on-sale (US/CA).")
 @app_commands.describe(hours="Look-back window in hours (default 1)")
 async def drop_changes_cmd(interaction: discord.Interaction, hours: Optional[int] = 1) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
+    if not await _tier_gate(interaction, "PRO"):
+        return
     if drop_catcher is None or not getattr(drop_catcher, "scan_new_onsales", None):
         await interaction.followup.send("❌ Drop catcher global scan not available in this build.", ephemeral=True)
         return
@@ -1210,6 +1309,49 @@ async def surge_remove_cmd(interaction: discord.Interaction, artist: str) -> Non
     except Exception as e:
         STATUS["last_error"] = f"surge_remove: {e}"
         await interaction.followup.send(f"❌ surge_remove failed: {e}", ephemeral=True)
+
+# ---------------------------------------------------------------------
+# Tier management (admin only)
+# ---------------------------------------------------------------------
+
+@tree.command(name="tier_set", description="(Admin) Set this server's tier: FREE | PRO | ELITE.")
+@app_commands.describe(tier="Tier to assign: FREE, PRO, or ELITE")
+@app_commands.default_member_permissions(administrator=True)
+async def tier_set_cmd(interaction: discord.Interaction, tier: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    tier = tier.strip().upper()
+    if tier not in _TIER_ORDER:
+        await _send_ephemeral(interaction, f"❌ Invalid tier `{tier}`. Use: FREE, PRO, ELITE.")
+        return
+    if not usage_db:
+        await _send_ephemeral(interaction, "❌ usage_db not available in this build.")
+        return
+    try:
+        import sqlite3 as _sqlite3, time as _time
+        usage_db.init_db()
+        db_path = os.getenv("VIKING_USAGE_DB_PATH", "/opt/viking-ai/viking_ai.sqlite")
+        conn = _sqlite3.connect(db_path, timeout=10)
+        conn.execute(
+            """
+            INSERT INTO guild_tiers (guild_id, tier, updated_ts)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET tier=excluded.tier, updated_ts=excluded.updated_ts
+            """,
+            (str(interaction.guild_id), tier, int(_time.time())),
+        )
+        conn.commit()
+        conn.close()
+        await _send_ephemeral(interaction, f"✅ Guild tier set to **{tier}**.")
+    except Exception as e:
+        STATUS["last_error"] = f"tier_set: {e}"
+        await _send_ephemeral(interaction, f"❌ tier_set failed: {e}")
+
+
+@tree.command(name="tier_check", description="Show this server's current tier.")
+async def tier_check_cmd(interaction: discord.Interaction) -> None:
+    tier = _get_guild_tier(interaction.guild_id)
+    await _send_ephemeral(interaction, f"This server is on tier: **{tier}**")
+
 
 # ---------------------------------------------------------------------
 # Lifecycle
