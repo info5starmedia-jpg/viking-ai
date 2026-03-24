@@ -1074,6 +1074,89 @@ async def drop_remove_cmd(interaction: discord.Interaction, event_id: str) -> No
         await interaction.followup.send(f"❌ drop_remove failed: {e}", ephemeral=True)
 
 
+@tree.command(name="drop_changes", description="Scan Ticketmaster now for music events that just went on-sale (US/CA).")
+@app_commands.describe(hours="Look-back window in hours (default 1)")
+async def drop_changes_cmd(interaction: discord.Interaction, hours: Optional[int] = 1) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if drop_catcher is None or not getattr(drop_catcher, "scan_new_onsales", None):
+        await interaction.followup.send("❌ Drop catcher global scan not available in this build.", ephemeral=True)
+        return
+    try:
+        hours_int = max(1, min(int(hours or 1), 24))
+        result = await asyncio.to_thread(drop_catcher.scan_new_onsales, hours_int)
+        new_items = result.get("new") or []
+        updated_items = result.get("updated") or []
+        total = len(new_items) + len(updated_items)
+        if not total:
+            await interaction.followup.send(
+                f"No new or updated on-sales in last {hours_int}h (window: {result.get('since')} → {result.get('until')}).",
+                ephemeral=True,
+            )
+            return
+        lines = [f"**On-sale scan — last {hours_int}h** ({total} found)"]
+        for ev in (new_items + updated_items)[:20]:
+            name = ev.get("name") or "?"
+            artist = ev.get("artist") or ""
+            city = ev.get("city") or ""
+            date_str = ev.get("event_local_date") or ""
+            pmin = ev.get("price_min")
+            pmax = ev.get("price_max")
+            change = ev.get("change_type") or ""
+            tag = "🆕" if change == "NEW" else "🔄"
+            line = f"{tag} **{name}**"
+            if artist:
+                line += f" — {artist}"
+            if city or date_str:
+                line += f" ({city} {date_str})".strip()
+            if pmin is not None and pmax is not None:
+                line += f" `${pmin:.0f}–${pmax:.0f}`"
+            lines.append(line)
+        await interaction.followup.send(_safe_truncate("\n".join(lines), 1900), ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"drop_changes: {e}"
+        await interaction.followup.send(f"❌ drop_changes failed: {e}", ephemeral=True)
+
+
+@tree.command(name="drop_tomorrow", description="Preview US/CA music events going on-sale tomorrow.")
+async def drop_tomorrow_cmd(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if drop_catcher is None or not getattr(drop_catcher, "scan_tomorrow_onsales", None):
+        await interaction.followup.send("❌ Drop catcher global scan not available in this build.", ephemeral=True)
+        return
+    try:
+        result = await asyncio.to_thread(drop_catcher.scan_tomorrow_onsales)
+        events = result.get("events") or []
+        date_str = result.get("date") or "tomorrow"
+        if not events:
+            await interaction.followup.send(f"No music on-sales found for {date_str} (US/CA).", ephemeral=True)
+            return
+        lines = [f"**Music on-sales for {date_str}** ({len(events)} events, US/CA)"]
+        for ev in events[:20]:
+            name = ev.get("name") or "?"
+            artist = ev.get("artist") or ""
+            city = ev.get("city") or ""
+            show_date = ev.get("event_local_date") or ""
+            pmin = ev.get("price_min")
+            pmax = ev.get("price_max")
+            url = ev.get("url") or ""
+            line = f"• **{name}**"
+            if artist:
+                line += f" — {artist}"
+            if city:
+                line += f" @ {city}"
+            if show_date:
+                line += f" ({show_date})"
+            if pmin is not None and pmax is not None:
+                line += f" `${pmin:.0f}–${pmax:.0f}`"
+            lines.append(line)
+            if url:
+                lines.append(f"  {url}")
+        await interaction.followup.send(_safe_truncate("\n".join(lines), 1900), ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"drop_tomorrow: {e}"
+        await interaction.followup.send(f"❌ drop_tomorrow failed: {e}", ephemeral=True)
+
+
 # ---------------------------------------------------------------------
 # Surge watch slash commands
 # ---------------------------------------------------------------------
