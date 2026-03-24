@@ -154,3 +154,21 @@ def get_guild_tier_override(guild_id: str) -> Optional[str]:
         return None
     finally:
         conn.close()
+
+
+def set_guild_tier(guild_id: str, tier: str) -> None:
+    """Upsert the tier for a guild. Tier should be FREE, PRO, or ELITE."""
+    init_db()
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO guild_tiers (guild_id, tier, updated_ts)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET tier=excluded.tier, updated_ts=excluded.updated_ts
+            """,
+            (str(guild_id), str(tier).strip().upper(), int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()

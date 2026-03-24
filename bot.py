@@ -17,6 +17,8 @@ import subprocess
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+import datetime as _dt
+
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -64,6 +66,10 @@ DROP_CATCHER_POLL_SECONDS = int(os.getenv("DROP_CATCHER_POLL_SECONDS", "300") or
 # Drop catcher alert channel/webhook (falls back to tour channel / default)
 DROP_CATCHER_CHANNEL_ID = int((os.getenv("DROP_CATCHER_CHANNEL_ID") or "0").strip() or 0)
 DROP_CATCHER_WEBHOOK_URL = (os.getenv("DROP_CATCHER_WEBHOOK_URL") or "").strip()
+
+# Daily digest — UTC hour to post (default 9 = 9:00 AM UTC)
+DROP_DIGEST_HOUR_UTC = int(os.getenv("DROP_DIGEST_HOUR_UTC", "9") or "9")
+DROP_DIGEST_ENABLED = os.getenv("DROP_DIGEST_ENABLED", "1").strip().lower() not in ("0", "false", "")
 
 # Optional: explicit git revision (can be injected by CI)
 GIT_REV = (os.getenv("GIT_REV") or "").strip()
@@ -206,7 +212,7 @@ async def _tier_gate(interaction: discord.Interaction, required: str) -> bool:
     guild_id = interaction.guild_id
     current = _get_guild_tier(guild_id)
     current_rank = _TIER_ORDER.get(current, 1)
-    required_rank = _TIER_ORDER.get(required.upper(), 1)
+    required_rank = _TIER_ORDER.get(required.upper(), max(_TIER_ORDER.values()))
 
     if current_rank >= required_rank:
         return True
@@ -829,6 +835,73 @@ async def _start_drop_catcher() -> None:
     _task_guard("drop_catcher", task)
     logger.info("Drop catcher loop started (%ss).", DROP_CATCHER_POLL_SECONDS)
 
+
+async def _daily_digest_loop() -> None:
+    """
+    Posts a morning digest of today's US/CA music on-sales once per day
+    at DROP_DIGEST_HOUR_UTC (default 9 AM UTC).
+    """
+    if not DROP_DIGEST_ENABLED:
+        logger.info("Daily digest disabled.")
+        return
+    if drop_catcher is None or not getattr(drop_catcher, "scan_tomorrow_onsales", None):
+        logger.info("Daily digest: drop_catcher not available; skipping.")
+        return
+
+    logger.info("Daily digest loop started (fires at %02d:00 UTC).", DROP_DIGEST_HOUR_UTC)
+
+    while True:
+        now_utc = _dt.datetime.now(_dt.timezone.utc)
+        # Seconds until the next target hour today (or tomorrow if already past)
+        target = now_utc.replace(hour=DROP_DIGEST_HOUR_UTC, minute=0, second=0, microsecond=0)
+        if now_utc >= target:
+            target += _dt.timedelta(days=1)
+        wait_secs = (target - now_utc).total_seconds()
+        logger.info("Daily digest: next post in %.0f seconds.", wait_secs)
+        await asyncio.sleep(wait_secs)
+
+        try:
+            result = await asyncio.to_thread(drop_catcher.scan_tomorrow_onsales)
+            events = result.get("events") or []
+            date_str = result.get("date") or "tomorrow"
+
+            if not events:
+                logger.info("Daily digest: no on-sales found for %s.", date_str)
+            else:
+                lines = [f"☀️ **Daily Drop Digest — on-sales for {date_str}** ({len(events)} events, US/CA)"]
+                for ev in events[:20]:
+                    name = ev.get("name") or "?"
+                    artist = ev.get("artist") or ""
+                    city = ev.get("city") or ""
+                    show_date = ev.get("event_local_date") or ""
+                    pmin = ev.get("price_min")
+                    pmax = ev.get("price_max")
+                    url = ev.get("url") or ""
+                    line = f"• **{name}**"
+                    if artist:
+                        line += f" — {artist}"
+                    if city:
+                        line += f" @ {city}"
+                    if show_date:
+                        line += f" ({show_date})"
+                    if pmin is not None and pmax is not None:
+                        line += f" `${pmin:.0f}–${pmax:.0f}`"
+                    lines.append(line)
+                    if url:
+                        lines.append(f"  {url}")
+
+                msg = _safe_truncate("\n".join(lines), 1900)
+                await post_message(msg, prefer="drop")
+                STATUS["last_posts"]["drop_catcher_unix"] = time.time()
+                logger.info("Daily digest posted: %d events for %s.", len(events), date_str)
+        except Exception as e:
+            STATUS["last_error"] = f"daily_digest: {e}"
+            logger.warning("Daily digest error: %s", e)
+
+        # Sleep 60s after posting to avoid double-firing on the same hour
+        await asyncio.sleep(60)
+
+
 # ---------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------
@@ -880,6 +953,7 @@ async def status_cmd(interaction: discord.Interaction) -> None:
             "tour_scan_monitor": TOUR_SCAN_POLL_SECONDS,
             "tm_surge_poll": TM_SURGE_POLL_SECONDS,
             "drop_catcher": DROP_CATCHER_POLL_SECONDS,
+            "drop_digest_hour_utc": DROP_DIGEST_HOUR_UTC,
             "intel_refresh": INTEL_REFRESH_SECONDS,
         },
         "tour_scan_mode": TOUR_SCAN_MODE,
@@ -1142,21 +1216,14 @@ async def drop_search_cmd(interaction: discord.Interaction, artist: str, limit: 
 
         lines = [f"**Events for _{artist}_** — use `/drop_add <event_id>` to watch one:"]
         for ev in events[:limit_int]:
-            eid = ev.get("id") or ev.get("event_id") or "?"
-            name = ev.get("name") or "Event"
-            date = ev.get("dates", {}).get("start", {}).get("localDate") or ev.get("date") or ""
-            venues = (ev.get("_embedded") or {}).get("venues") or [{}]
-            city = (venues[0].get("city") or {}).get("name") or ev.get("city") or ""
-            status = (ev.get("dates") or {}).get("status", {}).get("code") or "unknown"
-            price_ranges = ev.get("priceRanges") or []
-            price_str = ""
-            if price_ranges:
-                try:
-                    pmin = min(p.get("min", 0) for p in price_ranges if p.get("min") is not None)
-                    pmax = max(p.get("max", 0) for p in price_ranges if p.get("max") is not None)
-                    price_str = f" `${pmin:.0f}–${pmax:.0f}`"
-                except Exception:
-                    pass
+            norm = drop_catcher._normalize_event(ev) if drop_catcher else {}
+            eid = norm.get("id") or "?"
+            name = norm.get("name") or "Event"
+            date = norm.get("event_local_date") or ""
+            city = norm.get("city") or ""
+            status = norm.get("status") or "unknown"
+            pmin, pmax = norm.get("price_min"), norm.get("price_max")
+            price_str = f" `${pmin:.0f}–${pmax:.0f}`" if pmin is not None and pmax is not None else ""
             line = f"• `{eid}` — **{name}**"
             if date or city:
                 line += f" ({date} {city})".strip()
@@ -1327,20 +1394,7 @@ async def tier_set_cmd(interaction: discord.Interaction, tier: str) -> None:
         await _send_ephemeral(interaction, "❌ usage_db not available in this build.")
         return
     try:
-        import sqlite3 as _sqlite3, time as _time
-        usage_db.init_db()
-        db_path = os.getenv("VIKING_USAGE_DB_PATH", "/opt/viking-ai/viking_ai.sqlite")
-        conn = _sqlite3.connect(db_path, timeout=10)
-        conn.execute(
-            """
-            INSERT INTO guild_tiers (guild_id, tier, updated_ts)
-            VALUES (?, ?, ?)
-            ON CONFLICT(guild_id) DO UPDATE SET tier=excluded.tier, updated_ts=excluded.updated_ts
-            """,
-            (str(interaction.guild_id), tier, int(_time.time())),
-        )
-        conn.commit()
-        conn.close()
+        await asyncio.to_thread(usage_db.set_guild_tier, str(interaction.guild_id), tier)
         await _send_ephemeral(interaction, f"✅ Guild tier set to **{tier}**.")
     except Exception as e:
         STATUS["last_error"] = f"tier_set: {e}"
@@ -1370,6 +1424,10 @@ async def on_ready() -> None:
 
     # Start drop catcher loop (async)
     await _start_drop_catcher()
+
+    # Daily drop digest loop
+    t_digest = asyncio.create_task(_daily_digest_loop(), name="daily_digest")
+    _task_guard("daily_digest", t_digest)
 
     # Async monitor loops
     t_vf = asyncio.create_task(_verified_fan_loop(), name="verified_fan_loop")

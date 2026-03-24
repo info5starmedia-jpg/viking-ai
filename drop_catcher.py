@@ -28,6 +28,7 @@ import csv
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -263,11 +264,11 @@ def _event_hash(norm: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def _load_global_state() -> Dict[str, Any]:
-    if not os.path.exists(GLOBAL_STATE_FILE):
-        return {}
     try:
         with open(GLOBAL_STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f) or {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
     except Exception:
         return {}
 
@@ -737,11 +738,9 @@ def _parse_sell_through(seatmap_txt: Optional[str]) -> float:
     if not seatmap_txt:
         return 0.0
     try:
-        import re
         m = re.search(r"(\d+(?:\.\d+)?)%\s+open", seatmap_txt)
         if m:
-            open_pct = float(m.group(1))
-            return max(0.0, 100.0 - open_pct)
+            return max(0.0, 100.0 - float(m.group(1)))
     except Exception:
         pass
     return 0.0

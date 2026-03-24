@@ -3,7 +3,7 @@ price_monitor.py
 
 Real price-drop monitor for Viking AI.
 
-Reads watched events from the drop_watch_events SQLite table, polls
+Reads watched events from drop_catcher.list_drop_watches(), polls
 Ticketmaster for current price ranges, and returns alerts when prices
 drop by more than PRICE_DROP_THRESHOLD_PCT (default 10%).
 
@@ -11,7 +11,6 @@ Price history is persisted in price_state.json so previous prices
 survive restarts without touching drop_catcher's DB state.
 
 Env vars:
-  VIKING_DB_PATH             – SQLite path (default /opt/viking-ai/viking_ai.sqlite)
   PRICE_MONITOR_ENABLED      – set to 0 to disable (default 1)
   PRICE_DROP_THRESHOLD_PCT   – minimum % drop to alert (default 10)
   PRICE_STATE_FILE           – path to price state JSON (default alongside this file)
@@ -23,7 +22,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sqlite3
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -41,7 +39,6 @@ logger = logging.getLogger("price_monitor")
 PRICE_PREFIX = (os.getenv("PRICE_PREFIX") or "[PRICE]").strip()
 PRICE_MONITOR_ENABLED = os.getenv("PRICE_MONITOR_ENABLED", "1").strip().lower() not in ("0", "false", "")
 PRICE_DROP_THRESHOLD_PCT = float(os.getenv("PRICE_DROP_THRESHOLD_PCT", "10") or "10")
-DB_PATH = os.getenv("VIKING_DB_PATH", "/opt/viking-ai/viking_ai.sqlite")
 PRICE_STATE_FILE = os.getenv(
     "PRICE_STATE_FILE",
     os.path.join(os.path.dirname(__file__), "price_state.json"),
@@ -54,7 +51,7 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# Optional TM import
+# Optional deps
 # ---------------------------------------------------------------------------
 
 try:
@@ -62,6 +59,12 @@ try:
 except Exception as _e:
     _ta = None  # type: ignore
     logger.warning("price_monitor: ticketmaster_agent not available: %s", _e)
+
+try:
+    import drop_catcher as _dc  # type: ignore
+except Exception as _e:
+    _dc = None  # type: ignore
+    logger.warning("price_monitor: drop_catcher not available: %s", _e)
 
 
 # ---------------------------------------------------------------------------
@@ -80,11 +83,11 @@ class PriceAlert:
 # ---------------------------------------------------------------------------
 
 def _load_price_state() -> Dict[str, Any]:
-    if not os.path.exists(PRICE_STATE_FILE):
-        return {}
     try:
         with open(PRICE_STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f) or {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
     except Exception:
         return {}
 
@@ -98,46 +101,8 @@ def _save_price_state(state: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Watched events source (reads drop_watch_events table)
+# Helpers
 # ---------------------------------------------------------------------------
-
-def _get_watched_events() -> List[Dict[str, Any]]:
-    """Return non-expired watched events from drop_watch_events."""
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
-        rows = conn.execute(
-            """
-            SELECT event_id, artist, name, url
-            FROM drop_watch_events
-            WHERE expires_at_unix > ?
-            """,
-            (time.time(),),
-        ).fetchall()
-        conn.close()
-        return [{"event_id": r[0], "artist": r[1], "name": r[2], "url": r[3]} for r in rows]
-    except Exception as e:
-        logger.debug("price_monitor: could not read drop_watch_events: %s", e)
-        return []
-
-
-# ---------------------------------------------------------------------------
-# Price extraction
-# ---------------------------------------------------------------------------
-
-def _extract_prices(event: Dict[str, Any]) -> Optional[Dict[str, float]]:
-    """Return {min, max} price dict from a TM event, or None."""
-    price_ranges = event.get("priceRanges") or []
-    if not price_ranges:
-        return None
-    try:
-        pmin = min(p.get("min", 0) for p in price_ranges if p.get("min") is not None)
-        pmax = max(p.get("max", 0) for p in price_ranges if p.get("max") is not None)
-        if pmin > 0:
-            return {"min": float(pmin), "max": float(pmax)}
-    except Exception:
-        pass
-    return None
-
 
 def _pct_change(old: float, new: float) -> float:
     if old <= 0:
@@ -164,7 +129,11 @@ def poll_prices_once() -> List[Dict[str, Any]]:
         logger.debug("price_monitor: ticketmaster_agent unavailable; skipping.")
         return []
 
-    watched = _get_watched_events()
+    if _dc is None or not hasattr(_dc, "list_drop_watches"):
+        logger.debug("price_monitor: drop_catcher unavailable; skipping.")
+        return []
+
+    watched = _dc.list_drop_watches()
     if not watched:
         logger.debug("price_monitor: no watched events; skipping.")
         return []
@@ -187,16 +156,18 @@ def poll_prices_once() -> List[Dict[str, Any]]:
         if not isinstance(event, dict) or not event:
             continue
 
-        prices = _extract_prices(event)
-        if not prices:
+        # Use drop_catcher's normalizer for consistent price extraction
+        norm = _dc._normalize_event(event)
+        new_min = norm.get("price_min")
+        new_max = norm.get("price_max")
+
+        if new_min is None or new_min <= 0:
+            time.sleep(0.5)
             continue
 
-        new_min = prices["min"]
-        new_max = prices["max"]
-
-        name = event.get("name") or row.get("name") or f"Event {event_id}"
-        url = event.get("url") or row.get("url") or ""
-        artist = row.get("artist") or ""
+        name = norm.get("name") or row.get("name") or f"Event {event_id}"
+        url = norm.get("url") or row.get("url") or ""
+        artist = norm.get("artist") or row.get("artist") or ""
 
         prev = state.get(event_id) or {}
         prev_min = prev.get("price_min")
@@ -208,8 +179,8 @@ def poll_prices_once() -> List[Dict[str, Any]]:
         }
 
         if prev_min is None:
-            # First time seeing this event — store but don't alert
             logger.debug("price_monitor: first price snapshot for %s: $%.0f", event_id, new_min)
+            time.sleep(0.5)
             continue
 
         pct = _pct_change(prev_min, new_min)
@@ -234,12 +205,7 @@ def poll_prices_once() -> List[Dict[str, Any]]:
                 event_id, prev_min, new_min, pct,
             )
 
-        # Small sleep between TM requests (called synchronously in thread)
-        try:
-            import time as _t
-            _t.sleep(0.5)
-        except Exception:
-            pass
+        time.sleep(0.5)
 
     _save_price_state(updated_state)
     return alerts
