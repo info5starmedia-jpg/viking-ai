@@ -58,6 +58,13 @@ TOUR_SCAN_MODE = (os.getenv("TOUR_SCAN_MODE") or "fast").strip().lower()
 # Ticketmaster surge watch poll (seconds). Default 30 min.
 TM_SURGE_POLL_SECONDS = int(os.getenv("TM_SURGE_POLL_SECONDS", "1800") or "1800")
 
+# Drop catcher poll (seconds). Default 5 min.
+DROP_CATCHER_POLL_SECONDS = int(os.getenv("DROP_CATCHER_POLL_SECONDS", "300") or "300")
+
+# Drop catcher alert channel/webhook (falls back to tour channel / default)
+DROP_CATCHER_CHANNEL_ID = int((os.getenv("DROP_CATCHER_CHANNEL_ID") or "0").strip() or 0)
+DROP_CATCHER_WEBHOOK_URL = (os.getenv("DROP_CATCHER_WEBHOOK_URL") or "").strip()
+
 # Optional: explicit git revision (can be injected by CI)
 GIT_REV = (os.getenv("GIT_REV") or "").strip()
 
@@ -86,6 +93,7 @@ price_monitor = _try_import("price_monitor")
 verified_fan_monitor = _try_import("verified_fan_monitor")
 tour_scan_monitor = _try_import("tour_scan_monitor")
 tm_surge_watch = _try_import("tm_surge_watch")
+drop_catcher = _try_import("drop_catcher")
 
 ticketmaster_agent = _try_import("ticketmaster_agent")
 tour_news_agent_v3 = _try_import("tour_news_agent_v3")
@@ -125,12 +133,14 @@ STATUS: Dict[str, Any] = {
         "verified_fan_monitor": bool(verified_fan_monitor),
         "tour_scan_monitor": bool(tour_scan_monitor),
         "tm_surge_watch": bool(tm_surge_watch and getattr(tm_surge_watch, "is_available", lambda: False)()),
+        "drop_catcher": bool(drop_catcher and getattr(drop_catcher, "is_available", lambda: False)()),
     },
     "last_posts": {
         "price_unix": None,
         "vf_unix": None,
         "tour_unix": None,
         "tm_surge_unix": None,
+        "drop_catcher_unix": None,
     },
     "tasks": {},
 }
@@ -184,7 +194,7 @@ async def _send_webhook(url: str, content: str) -> None:
 
 async def post_message(content: str, *, prefer: str = "default") -> None:
     """
-    prefer: default | price | vf | tour
+    prefer: default | price | vf | tour | drop
     Uses webhook if set, else falls back to channel.
     """
     if prefer == "price" and PRICE_WEBHOOK_URL:
@@ -196,6 +206,9 @@ async def post_message(content: str, *, prefer: str = "default") -> None:
     if prefer == "tour" and TOUR_SCAN_WEBHOOK_URL:
         await _send_webhook(TOUR_SCAN_WEBHOOK_URL, content)
         return
+    if prefer == "drop" and DROP_CATCHER_WEBHOOK_URL:
+        await _send_webhook(DROP_CATCHER_WEBHOOK_URL, content)
+        return
 
     target_channel_id = 0
     if prefer == "price":
@@ -204,12 +217,15 @@ async def post_message(content: str, *, prefer: str = "default") -> None:
         target_channel_id = VERIFIED_FAN_ALERT_CHANNEL_ID or DEFAULT_CHANNEL_ID
     elif prefer == "tour":
         target_channel_id = TOUR_SCAN_ALERT_CHANNEL_ID or DEFAULT_CHANNEL_ID
+    elif prefer == "drop":
+        target_channel_id = DROP_CATCHER_CHANNEL_ID or DEFAULT_CHANNEL_ID
     else:
         target_channel_id = (
             DEFAULT_CHANNEL_ID
             or PRICE_ALERT_CHANNEL_ID
             or VERIFIED_FAN_ALERT_CHANNEL_ID
             or TOUR_SCAN_ALERT_CHANNEL_ID
+            or DROP_CATCHER_CHANNEL_ID
         )
 
     ch = await _get_channel(target_channel_id)
@@ -745,6 +761,28 @@ async def _start_tm_surge_watch() -> None:
     _task_guard("tm_surge_watch", task)
     logger.info("TM surge watch loop started (%ss).", TM_SURGE_POLL_SECONDS)
 
+
+async def _start_drop_catcher() -> None:
+    if drop_catcher is None:
+        logger.info("drop_catcher not available; skipping.")
+        return
+    is_avail = getattr(drop_catcher, "is_available", None)
+    if callable(is_avail) and not is_avail():
+        logger.info("drop_catcher: ticketmaster agent unavailable; skipping.")
+        return
+
+    async def _discord_post(msg: str) -> None:
+        await post_message(msg, prefer="drop")
+        STATUS["last_posts"]["drop_catcher_unix"] = time.time()
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        drop_catcher.drop_watch_loop(discord_post=_discord_post, stop_event=stop_event),
+        name="drop_catcher",
+    )
+    _task_guard("drop_catcher", task)
+    logger.info("Drop catcher loop started (%ss).", DROP_CATCHER_POLL_SECONDS)
+
 # ---------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------
@@ -795,6 +833,7 @@ async def status_cmd(interaction: discord.Interaction) -> None:
             "verified_fan_monitor": VERIFIED_FAN_POLL_SECONDS,
             "tour_scan_monitor": TOUR_SCAN_POLL_SECONDS,
             "tm_surge_poll": TM_SURGE_POLL_SECONDS,
+            "drop_catcher": DROP_CATCHER_POLL_SECONDS,
             "intel_refresh": INTEL_REFRESH_SECONDS,
         },
         "tour_scan_mode": TOUR_SCAN_MODE,
@@ -973,6 +1012,69 @@ async def city_debug_cmd(interaction: discord.Interaction, artist: str) -> None:
     await _send_ephemeral(interaction, _safe_truncate("\n".join(lines), 1900))
 
 # ---------------------------------------------------------------------
+# Drop catcher slash commands
+# ---------------------------------------------------------------------
+
+@tree.command(name="drop_add", description="Watch a Ticketmaster event ID for ticket availability drops.")
+@app_commands.describe(event_id="Ticketmaster event ID", artist="Artist name (optional label)", days="Days to watch (default 7)")
+async def drop_add_cmd(interaction: discord.Interaction, event_id: str, artist: Optional[str] = "", days: Optional[int] = 7) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if drop_catcher is None or not getattr(drop_catcher, "add_drop_watch", None):
+        await interaction.followup.send("❌ Drop catcher not available in this build.", ephemeral=True)
+        return
+    try:
+        ok, msg = await asyncio.to_thread(drop_catcher.add_drop_watch, event_id, artist or "", int(days or 7))
+        await interaction.followup.send(("✅ " if ok else "❌ ") + msg, ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"drop_add: {e}"
+        await interaction.followup.send(f"❌ drop_add failed: {e}", ephemeral=True)
+
+
+@tree.command(name="drop_list", description="List all active drop watch events.")
+async def drop_list_cmd(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if drop_catcher is None or not getattr(drop_catcher, "list_drop_watches", None):
+        await interaction.followup.send("❌ Drop catcher not available in this build.", ephemeral=True)
+        return
+    try:
+        rows = await asyncio.to_thread(drop_catcher.list_drop_watches)
+        if not rows:
+            await interaction.followup.send("No drop watches active.", ephemeral=True)
+            return
+        now = time.time()
+        lines = ["**Active drop watches**"]
+        for r in rows[:25]:
+            eid = r.get("event_id") or "?"
+            name = r.get("name") or r.get("artist") or eid
+            expires = float(r.get("expires_at_unix") or 0)
+            hrs = max(0, int((expires - now) / 3600))
+            status = r.get("last_status") or "unknown"
+            checked = r.get("last_check_unix") or 0
+            checked_ago = int((now - checked) / 60) if checked else None
+            checked_str = f"{checked_ago}m ago" if checked_ago is not None else "never"
+            lines.append(f"• `{eid}` — {name} | status=`{status}` | last checked {checked_str} | expires ~{hrs}h")
+        await interaction.followup.send(_safe_truncate("\n".join(lines), 1900), ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"drop_list: {e}"
+        await interaction.followup.send(f"❌ drop_list failed: {e}", ephemeral=True)
+
+
+@tree.command(name="drop_remove", description="Remove a Ticketmaster event from the drop watch list.")
+@app_commands.describe(event_id="Ticketmaster event ID to stop watching")
+async def drop_remove_cmd(interaction: discord.Interaction, event_id: str) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if drop_catcher is None or not getattr(drop_catcher, "remove_drop_watch", None):
+        await interaction.followup.send("❌ Drop catcher not available in this build.", ephemeral=True)
+        return
+    try:
+        ok, msg = await asyncio.to_thread(drop_catcher.remove_drop_watch, event_id)
+        await interaction.followup.send(("✅ " if ok else "❌ ") + msg, ephemeral=True)
+    except Exception as e:
+        STATUS["last_error"] = f"drop_remove: {e}"
+        await interaction.followup.send(f"❌ drop_remove failed: {e}", ephemeral=True)
+
+
+# ---------------------------------------------------------------------
 # Surge watch slash commands
 # ---------------------------------------------------------------------
 @tree.command(name="surge_add", description="Enable Ticketmaster surge watch for an artist.")
@@ -1040,6 +1142,9 @@ async def on_ready() -> None:
 
     # Start surge watch loop (async)
     await _start_tm_surge_watch()
+
+    # Start drop catcher loop (async)
+    await _start_drop_catcher()
 
     # Async monitor loops
     t_vf = asyncio.create_task(_verified_fan_loop(), name="verified_fan_loop")
