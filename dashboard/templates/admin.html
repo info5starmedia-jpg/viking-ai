@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin — Viking AI</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="app-layout">
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <span class="logo-icon">⚡</span>
+      <span>Viking AI</span>
+    </div>
+    <nav class="sidebar-nav">
+      <div class="nav-label">Admin</div>
+      <a href="/admin" class="nav-link active">
+        <span class="nav-icon">📊</span> Overview
+      </a>
+      <a href="/dashboard" class="nav-link">
+        <span class="nav-icon">🎯</span> My Setup
+      </a>
+    </nav>
+    <div class="sidebar-user">
+      {% if user.avatar_url %}
+        <img src="{{ user.avatar_url }}" alt="avatar" class="user-avatar">
+      {% else %}
+        <div class="user-avatar-placeholder">{{ user.display_name[0]|upper }}</div>
+      {% endif %}
+      <div class="user-info">
+        <div class="user-name">{{ user.display_name }}</div>
+        <div class="user-email" style="color:var(--accent); font-weight:600;">Admin</div>
+      </div>
+      <a href="/logout" class="logout-btn" title="Sign out">↩</a>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main-content">
+
+    <div class="page-header">
+      <h1 class="page-title">Admin Overview</h1>
+      <p class="page-subtitle">Platform-wide stats across all clients.</p>
+    </div>
+
+    <!-- Flash messages -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="flash-container">
+          {% for category, message in messages %}
+            <div class="flash flash-{{ 'error' if category == 'error' else 'success' if category == 'success' else 'info' }}">
+              {{ '✓' if category == 'success' else '⚠' if category == 'error' else 'ℹ' }}
+              {{ message }}
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <!-- Stats Grid -->
+    <div class="stats-grid">
+      <div class="stat-card green">
+        <div class="stat-label">Active Clients</div>
+        <div class="stat-value">{{ stats.total_clients }}</div>
+        <div class="stat-sub">Signed-up users</div>
+      </div>
+      <div class="stat-card accent">
+        <div class="stat-label">URLs Monitored</div>
+        <div class="stat-value">{{ stats.total_monitors }}</div>
+        <div class="stat-sub">Across all clients</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Total Clients</div>
+        <div class="stat-value">{{ stats.all_clients|length }}</div>
+        <div class="stat-sub">Including inactive</div>
+      </div>
+    </div>
+
+    <!-- Top 5 URLs -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <span class="icon">🔥</span> Top 5 Most-Monitored URLs
+        </span>
+        <span class="card-badge">by unique clients</span>
+      </div>
+      <div class="card-body no-pad">
+        {% if stats.top_urls %}
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>URL</th>
+                <th>Clients Watching</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in stats.top_urls %}
+              <tr>
+                <td style="width:48px; font-weight:700; color:var(--accent);">
+                  {% if loop.index == 1 %}🥇
+                  {% elif loop.index == 2 %}🥈
+                  {% elif loop.index == 3 %}🥉
+                  {% else %}#{{ loop.index }}{% endif %}
+                </td>
+                <td>
+                  <a href="{{ row.url }}" target="_blank" rel="noopener" class="cell-url" title="{{ row.url }}">
+                    {{ row.url }}
+                  </a>
+                </td>
+                <td>
+                  <span class="badge badge-green">{{ row.client_count }} client{{ 's' if row.client_count != 1 }}</span>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty-state">
+            <div class="empty-icon">🔥</div>
+            No monitors added yet by any client.
+          </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- All Clients -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <span class="icon">👥</span> All Clients
+        </span>
+        <span class="card-badge">{{ stats.all_clients|length }} total</span>
+      </div>
+      <div class="card-body no-pad">
+        {% if stats.all_clients %}
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Client</th>
+                <th>Email</th>
+                <th>Monitors</th>
+                <th>Proxies</th>
+                <th>Joined</th>
+                <th>Status</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for client in stats.all_clients %}
+              <tr>
+                <td style="font-weight:500;">{{ client.display_name or '—' }}</td>
+                <td class="cell-mono" style="font-size:0.78rem;">{{ client.email or '—' }}</td>
+                <td>{{ client.monitor_count }}</td>
+                <td>{{ client.proxy_count }}</td>
+                <td style="color:var(--text-muted); font-size:0.8rem;">
+                  {% if client.created_at %}
+                    {{ (client.created_at | int) | datetimeformat if datetimeformat is defined else client.created_at | int }}
+                  {% else %}—{% endif %}
+                </td>
+                <td>
+                  {% if client.active %}
+                    <span class="badge badge-green"><span class="badge-dot"></span>Active</span>
+                  {% else %}
+                    <span class="badge badge-red"><span class="badge-dot"></span>Disabled</span>
+                  {% endif %}
+                </td>
+                <td>
+                  {% if client.active %}
+                    <form action="/admin/client/{{ client.id }}/toggle" method="POST" style="display:inline;">
+                      <input type="hidden" name="active" value="0">
+                      <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Disable this client?')">Disable</button>
+                    </form>
+                  {% else %}
+                    <form action="/admin/client/{{ client.id }}/toggle" method="POST" style="display:inline;">
+                      <input type="hidden" name="active" value="1">
+                      <button type="submit" class="btn btn-ghost btn-sm">Enable</button>
+                    </form>
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty-state">
+            <div class="empty-icon">👥</div>
+            No clients have signed up yet.
+          </div>
+        {% endif %}
+      </div>
+    </div>
+
+  </main>
+</div>
+</body>
+</html>

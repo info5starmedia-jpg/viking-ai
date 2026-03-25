@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard — Viking AI</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="app-layout">
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <span class="logo-icon">⚡</span>
+      <span>Viking AI</span>
+    </div>
+    <nav class="sidebar-nav">
+      <div class="nav-label">Setup</div>
+      <a href="#monitors" class="nav-link active">
+        <span class="nav-icon">🎯</span> Monitors
+      </a>
+      <a href="#proxies" class="nav-link">
+        <span class="nav-icon">🔀</span> Proxies
+      </a>
+      <a href="#webhook" class="nav-link">
+        <span class="nav-icon">🔔</span> Discord Webhook
+      </a>
+
+      {% if is_admin %}
+      <div class="nav-label" style="margin-top:16px;">Admin</div>
+      <a href="/admin" class="nav-link">
+        <span class="nav-icon">📊</span> Overview
+      </a>
+      {% endif %}
+    </nav>
+    <div class="sidebar-user">
+      {% if user.avatar_url %}
+        <img src="{{ user.avatar_url }}" alt="avatar" class="user-avatar">
+      {% else %}
+        <div class="user-avatar-placeholder">{{ user.display_name[0]|upper }}</div>
+      {% endif %}
+      <div class="user-info">
+        <div class="user-name">{{ user.display_name }}</div>
+        <div class="user-email">{{ user.email or 'No email' }}</div>
+      </div>
+      <a href="/logout" class="logout-btn" title="Sign out">↩</a>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main-content">
+
+    <div class="page-header">
+      <h1 class="page-title">Drop Catcher Setup</h1>
+      <p class="page-subtitle">Configure your monitors, proxies, and Discord alerts below.</p>
+    </div>
+
+    <!-- Flash messages -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="flash-container">
+          {% for category, message in messages %}
+            <div class="flash flash-{{ 'error' if category == 'error' else 'success' if category == 'success' else 'info' }}">
+              {{ '✓' if category == 'success' else '⚠' if category == 'error' else 'ℹ' }}
+              {{ message }}
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <!-- ================================================================
+         SECTION 1 — MONITORS
+         ================================================================ -->
+    <div id="monitors" class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <span class="icon">🎯</span> Ticketmaster URLs to Monitor
+        </span>
+        <span class="card-badge">{{ monitors|length }} active</span>
+      </div>
+
+      <!-- Add form -->
+      <div class="card-body" style="border-bottom:1px solid var(--border);">
+        <form action="/api/monitor/add" method="POST">
+          <div class="form-row">
+            <div class="form-group" style="flex:2; min-width:200px;">
+              <label for="url">Ticketmaster URL</label>
+              <input
+                type="url"
+                id="url"
+                name="url"
+                class="input-mono"
+                placeholder="https://www.ticketmaster.com/event/..."
+                required
+              >
+            </div>
+            <div class="form-group" style="flex:1;">
+              <label for="label">Label (optional)</label>
+              <input type="text" id="label" name="label" placeholder="e.g. Taylor Swift MSG">
+            </div>
+            <div class="form-group" style="align-self:flex-end; flex:0 0 auto;">
+              <button type="submit" class="btn btn-primary">+ Add Monitor</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+      <!-- Monitors table -->
+      <div class="card-body no-pad">
+        {% if monitors %}
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Label</th>
+                <th>URL</th>
+                <th>Status</th>
+                <th>Alerts</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for m in monitors %}
+              <tr>
+                <td>{{ m.label or '—' }}</td>
+                <td>
+                  <a href="{{ m.url }}" target="_blank" rel="noopener" class="cell-url" title="{{ m.url }}">
+                    {{ m.url }}
+                  </a>
+                </td>
+                <td>
+                  {% if m.last_status == 'onsale' %}
+                    <span class="badge badge-green"><span class="badge-dot"></span>On Sale</span>
+                  {% elif m.last_status == 'offsale' %}
+                    <span class="badge badge-red"><span class="badge-dot"></span>Off Sale</span>
+                  {% else %}
+                    <span class="badge badge-grey"><span class="badge-dot"></span>{{ m.last_status|title }}</span>
+                  {% endif %}
+                </td>
+                <td>{{ m.alert_count }}</td>
+                <td>
+                  <form action="/api/monitor/delete/{{ m.id }}" method="POST" onsubmit="return confirm('Remove this monitor?')">
+                    <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty-state">
+            <div class="empty-icon">🎯</div>
+            No monitors yet. Paste a Ticketmaster URL above to start watching.
+          </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- ================================================================
+         SECTION 2 — PROXIES
+         ================================================================ -->
+    <div id="proxies" class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <span class="icon">🔀</span> HTTP Proxies
+        </span>
+        <span class="card-badge">{{ proxies|length }} loaded</span>
+      </div>
+
+      <!-- Add form -->
+      <div class="card-body" style="border-bottom:1px solid var(--border);">
+        <form action="/api/proxy/add" method="POST">
+          <div class="form-row">
+            <div class="form-group" style="flex:1;">
+              <label for="proxy">Proxy</label>
+              <input
+                type="text"
+                id="proxy"
+                name="proxy"
+                class="input-mono"
+                placeholder="host:port  or  host:port:user:pass"
+                required
+              >
+            </div>
+            <div class="form-group" style="align-self:flex-end; flex:0 0 auto;">
+              <button type="submit" class="btn btn-primary">+ Add Proxy</button>
+            </div>
+          </div>
+          <p style="font-size:0.75rem; color:var(--text-muted); margin-top:8px;">
+            HTTP proxies only. Format: <code style="font-family:var(--mono)">host:port</code> or <code style="font-family:var(--mono)">host:port:username:password</code>
+          </p>
+        </form>
+      </div>
+
+      <!-- Proxies table -->
+      <div class="card-body no-pad">
+        {% if proxies %}
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Proxy</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for p in proxies %}
+              <tr>
+                <td style="color:var(--text-muted); width:40px;">{{ loop.index }}</td>
+                <td class="cell-mono">{{ p.proxy }}</td>
+                <td>
+                  <form action="/api/proxy/delete/{{ p.id }}" method="POST" onsubmit="return confirm('Remove this proxy?')">
+                    <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty-state">
+            <div class="empty-icon">🔀</div>
+            No proxies added. Proxies are optional but recommended for high-frequency monitoring.
+          </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- ================================================================
+         SECTION 3 — DISCORD WEBHOOK
+         ================================================================ -->
+    <div id="webhook" class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <span class="icon">🔔</span> Discord Webhook
+        </span>
+        {% if current_webhook %}
+          <span class="badge badge-green"><span class="badge-dot"></span>Connected</span>
+        {% else %}
+          <span class="badge badge-grey">Not set</span>
+        {% endif %}
+      </div>
+
+      <div class="card-body">
+        <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:16px; line-height:1.6;">
+          Paste your Discord channel's webhook URL. Drop alerts will be posted there instantly.
+          This webhook applies to <strong style="color:var(--text);">all</strong> your monitors.
+          <br><br>
+          To create one: Discord → Channel Settings → Integrations → Webhooks → New Webhook → Copy URL.
+        </p>
+        <form action="/api/webhook/save" method="POST">
+          <div class="form-row">
+            <div class="form-group" style="flex:1;">
+              <label for="discord_webhook">Webhook URL</label>
+              <input
+                type="url"
+                id="discord_webhook"
+                name="discord_webhook"
+                class="input-mono"
+                value="{{ current_webhook }}"
+                placeholder="https://discord.com/api/webhooks/..."
+              >
+            </div>
+            <div class="form-group" style="align-self:flex-end; flex:0 0 auto;">
+              <button type="submit" class="btn btn-primary">Save Webhook</button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- Highlight active nav section on scroll -->
+<script>
+  const sections = ['monitors','proxies','webhook'];
+  const links = {};
+  sections.forEach(id => {
+    links[id] = document.querySelector(`.nav-link[href="#${id}"]`);
+  });
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting && links[e.target.id]) {
+        Object.values(links).forEach(l => l && l.classList.remove('active'));
+        links[e.target.id].classList.add('active');
+      }
+    });
+  }, { threshold: 0.4 });
+  sections.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) observer.observe(el);
+  });
+</script>
+</body>
+</html>
