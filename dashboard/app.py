@@ -335,6 +335,10 @@ def dashboard():
         remaining = (sub["current_period_end"] + extra * 86400) - time.time()
         days_left = max(0, int(remaining / 86400))
 
+    hot_picks         = dashboard_db.get_hot_picks(active_only=True)
+    personal_watchlist = dashboard_db.get_personal_watchlist(client_id)
+    watchlist_limit   = dashboard_db.get_watchlist_limit(client_id)
+
     return render_template(
         "dashboard.html",
         user=user,
@@ -345,6 +349,9 @@ def dashboard():
         monitor_limit=limit,
         days_left=days_left,
         is_admin=is_admin(),
+        hot_picks=hot_picks,
+        personal_watchlist=personal_watchlist,
+        watchlist_limit=watchlist_limit,
     )
 
 
@@ -411,8 +418,19 @@ def api_monitor_add():
                 webhook = m["discord_webhook"]
                 break
 
-    dashboard_db.add_monitor(user["id"], url, label, webhook)
-    flash("Monitor added.", "success")
+    # Auto-detect platform from URL
+    url_lower = url.lower()
+    if "seatgeek.com" in url_lower:
+        platform = "seatgeek"
+    elif "stubhub.com" in url_lower:
+        platform = "stubhub"
+    elif "vividseats.com" in url_lower:
+        platform = "vividseats"
+    else:
+        platform = "ticketmaster"
+
+    dashboard_db.add_monitor(user["id"], url, label, webhook, platform=platform)
+    flash(f"Monitor added ({platform.title()}).", "success")
     return redirect(url_for("dashboard") + "#monitors")
 
 
@@ -439,6 +457,32 @@ def api_webhook_save():
 
 
 # ---------------------------------------------------------------------------
+# Personal watchlist
+# ---------------------------------------------------------------------------
+
+@app.route("/api/watchlist/add", methods=["POST"])
+@login_required
+@active_sub_required
+def api_watchlist_add():
+    user   = current_user()
+    artist = (request.form.get("artist") or "").strip()
+    if not artist:
+        flash("Artist name is required.", "error")
+        return redirect(url_for("dashboard") + "#watchlist")
+    ok, msg = dashboard_db.add_personal_watchlist(user["id"], artist)
+    flash(msg, "success" if ok else "error")
+    return redirect(url_for("dashboard") + "#watchlist")
+
+
+@app.route("/api/watchlist/remove/<int:entry_id>", methods=["POST"])
+@login_required
+def api_watchlist_remove(entry_id):
+    dashboard_db.remove_personal_watchlist(entry_id, current_user()["id"])
+    flash("Removed from watchlist.", "success")
+    return redirect(url_for("dashboard") + "#watchlist")
+
+
+# ---------------------------------------------------------------------------
 # Stripe webhook
 # ---------------------------------------------------------------------------
 
@@ -459,8 +503,17 @@ def stripe_webhook():
 @app.route("/admin")
 @admin_required
 def admin():
-    stats = dashboard_db.get_admin_stats()
-    return render_template("admin.html", user=current_user(), stats=stats, is_admin=True)
+    stats           = dashboard_db.get_admin_stats()
+    hot_picks       = dashboard_db.get_hot_picks(active_only=False)
+    global_watchlist = dashboard_db.get_global_watchlist(active_only=False)
+    return render_template(
+        "admin.html",
+        user=current_user(),
+        stats=stats,
+        hot_picks=hot_picks,
+        global_watchlist=global_watchlist,
+        is_admin=True,
+    )
 
 
 @app.route("/admin/client/<int:client_id>")
@@ -566,6 +619,55 @@ def admin_invite_extend(code):
     dashboard_db.extend_invite_code(code, days, admin_name)
     flash(f"Code {code} extended by {days} days.", "success")
     return redirect(url_for("admin") + "#invites")
+
+
+# --- Hot picks management ---
+
+@app.route("/admin/hotpick/add", methods=["POST"])
+@admin_required
+def admin_hotpick_add():
+    artist    = (request.form.get("artist") or "").strip()
+    note      = (request.form.get("note") or "").strip()[:300]
+    image_url = (request.form.get("image_url") or "").strip()
+    if not artist:
+        flash("Artist name is required.", "error")
+        return redirect(url_for("admin") + "#hotpicks")
+    dashboard_db.admin_add_hot_pick(artist, note, image_url)
+    flash(f"Hot pick added: {artist}", "success")
+    return redirect(url_for("admin") + "#hotpicks")
+
+
+@app.route("/admin/hotpick/<int:pick_id>/deactivate", methods=["POST"])
+@admin_required
+def admin_hotpick_deactivate(pick_id):
+    admin_name = current_user().get("display_name", "admin")
+    dashboard_db.admin_deactivate_hot_pick(pick_id, admin_name)
+    flash("Hot pick removed.", "success")
+    return redirect(url_for("admin") + "#hotpicks")
+
+
+# --- Global watchlist management ---
+
+@app.route("/admin/watchlist/add", methods=["POST"])
+@admin_required
+def admin_watchlist_add():
+    artist    = (request.form.get("artist") or "").strip()
+    note      = (request.form.get("note") or "").strip()[:200]
+    if not artist:
+        flash("Artist name is required.", "error")
+        return redirect(url_for("admin") + "#watchlist")
+    dashboard_db.admin_add_global_watchlist(artist, note)
+    flash(f"Added {artist} to global watchlist.", "success")
+    return redirect(url_for("admin") + "#watchlist")
+
+
+@app.route("/admin/watchlist/remove/<int:wl_id>", methods=["POST"])
+@admin_required
+def admin_watchlist_remove(wl_id):
+    admin_name = current_user().get("display_name", "admin")
+    dashboard_db.admin_remove_global_watchlist(wl_id, admin_name)
+    flash("Removed from global watchlist.", "success")
+    return redirect(url_for("admin") + "#watchlist")
 
 
 # ---------------------------------------------------------------------------

@@ -94,6 +94,16 @@ GLOBAL_STATE_FILE = os.path.join(os.path.dirname(__file__), "drop_global_state.j
 # Status codes meaning "no tickets available right now"
 _OFFSALE_CODES = {"offsale", "cancelled", "postponed", "rescheduled"}
 
+# Aggressive mode config
+AGGRESSIVE_ENABLED       = os.getenv("DROP_AGGRESSIVE_ENABLED", "1").strip().lower() not in ("0", "false")
+AGGRESSIVE_POLL_SECONDS  = int(os.getenv("DROP_AGGRESSIVE_POLL_SECONDS", "3") or "3")
+AGGRESSIVE_WINDOW_SECS   = int(os.getenv("DROP_AGGRESSIVE_WINDOW_SECS", "300") or "300")  # T-5min
+AGGRESSIVE_PREWARM_SECS  = int(os.getenv("DROP_AGGRESSIVE_PREWARM_SECS", "60") or "60")   # T-60s pre-warm
+AGGRESSIVE_EXPIRE_SECS   = int(os.getenv("DROP_AGGRESSIVE_EXPIRE_SECS", "600") or "600")  # T+10min expire
+
+# In-memory: event_id -> {onsale_unix, url, warmed, added_unix}
+_aggressive_targets: Dict[str, Dict[str, Any]] = {}
+
 
 # ---------------------------------------------------------------------------
 # Availability check
@@ -230,6 +240,19 @@ def _normalize_event(e: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
+    # Extract public on-sale start time for aggressive mode
+    sales = e.get("sales") or {}
+    public_sales = sales.get("public") or {}
+    onsale_start_str = public_sales.get("startDateTime") or ""
+    onsale_start_unix = None
+    if onsale_start_str:
+        try:
+            from datetime import datetime, timezone as _tz
+            dt = datetime.strptime(onsale_start_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_tz.utc)
+            onsale_start_unix = dt.timestamp()
+        except Exception:
+            pass
+
     return {
         "id": e.get("id") or "",
         "name": e.get("name") or "",
@@ -243,6 +266,7 @@ def _normalize_event(e: Dict[str, Any]) -> Dict[str, Any]:
         "country": country,
         "price_min": price_min,
         "price_max": price_max,
+        "onsale_start_unix": onsale_start_unix,
     }
 
 
@@ -677,6 +701,118 @@ def _extract_prices(event: Dict[str, Any]) -> Tuple[Optional[float], Optional[fl
 # Background loop
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Aggressive mode — public API
+# ---------------------------------------------------------------------------
+
+def register_aggressive_target(event_id: str, onsale_unix: float, url: str = "") -> None:
+    """
+    Register an event for aggressive polling.
+    Called from bot slash commands or automatically from _poll_watched_events
+    when an on-sale time is detected within AGGRESSIVE_WINDOW_SECS.
+    """
+    if not AGGRESSIVE_ENABLED:
+        return
+    if event_id not in _aggressive_targets:
+        logger.info("drop_catcher: aggressive target registered — %s (onsale=%s)", event_id, onsale_unix)
+    _aggressive_targets[event_id] = {
+        "onsale_unix": onsale_unix,
+        "url": url,
+        "warmed": False,
+        "added_unix": time.time(),
+    }
+
+
+def list_aggressive_targets() -> List[Dict[str, Any]]:
+    return [{"event_id": k, **v} for k, v in _aggressive_targets.items()]
+
+
+def _prune_aggressive_targets() -> None:
+    """Remove targets that are more than AGGRESSIVE_EXPIRE_SECS past their on-sale time."""
+    now = time.time()
+    expired = [
+        eid for eid, t in _aggressive_targets.items()
+        if now > t["onsale_unix"] + AGGRESSIVE_EXPIRE_SECS
+    ]
+    for eid in expired:
+        logger.info("drop_catcher: aggressive target expired — %s", eid)
+        del _aggressive_targets[eid]
+
+
+def _prewarm_url(url: str) -> None:
+    """Non-blocking HTTP HEAD to warm the TCP connection to TM."""
+    if not url:
+        return
+    try:
+        import requests as _req
+        _req.head(url, timeout=5, allow_redirects=False)
+        logger.debug("drop_catcher: pre-warmed %s", url)
+    except Exception:
+        pass
+
+
+async def _aggressive_poll_cycle(
+    discord_post: Callable[[Any], Awaitable[None]],
+) -> None:
+    """
+    Single cycle of aggressive polling for all active targets.
+    Runs every AGGRESSIVE_POLL_SECONDS seconds when targets exist.
+    """
+    _prune_aggressive_targets()
+    now = time.time()
+
+    for event_id, target in list(_aggressive_targets.items()):
+        onsale_unix = target["onsale_unix"]
+        url = target["url"]
+
+        # Pre-warm at T-PREWARM_SECS
+        if not target["warmed"] and 0 < (onsale_unix - now) <= AGGRESSIVE_PREWARM_SECS:
+            logger.info("drop_catcher: pre-warming %s (T-%ds)", event_id, int(onsale_unix - now))
+            await asyncio.to_thread(_prewarm_url, url)
+            _aggressive_targets[event_id]["warmed"] = True
+
+        # Fast-poll the event
+        if not is_available():
+            continue
+        try:
+            event = await asyncio.to_thread(_ta.get_event_details, event_id)
+        except Exception as e:
+            logger.warning("drop_catcher: aggressive poll failed for %s: %s", event_id, e)
+            continue
+
+        if not isinstance(event, dict) or not event:
+            continue
+
+        norm = _normalize_event(event)
+        new_status = norm["status"] or _extract_status(event)
+        old_status = "unknown"  # We don't track state here — drop_watch_loop handles persistence
+
+        if _is_dropped(old_status, new_status):
+            # Update DB via the normal watch path (avoid double-alert by checking drop_watch_events)
+            logger.info("drop_catcher: AGGRESSIVE DROP %s (%s)", event_id, new_status)
+            alert_data: Dict[str, Any] = {
+                "type": "sale_start",
+                "event_id": event_id,
+                "name": norm.get("name") or f"Event {event_id}",
+                "artist": norm.get("artist") or "",
+                "url": norm.get("url") or url,
+                "city": norm.get("city") or "",
+                "event_local_date": norm.get("event_local_date") or "",
+                "price_min": norm.get("price_min"),
+                "price_max": norm.get("price_max"),
+                "source": "Ticketmaster",
+                "text": f"🚀 AGGRESSIVE DROP — {norm.get('name') or event_id} is now ON SALE",
+            }
+            try:
+                await discord_post(alert_data)
+            except Exception as e:
+                logger.warning("drop_catcher: aggressive discord_post failed: %s", e)
+            # Remove target after firing so it doesn't spam
+            _aggressive_targets.pop(event_id, None)
+
+        await asyncio.sleep(0.5)
+
+
 async def drop_watch_loop(
     discord_post: Callable[[Any], Awaitable[None]],
     stop_event: Optional[asyncio.Event] = None,
@@ -699,6 +835,7 @@ async def drop_watch_loop(
     )
 
     last_global_scan = 0.0
+    last_normal_poll = 0.0
 
     while True:
         if stop_event and stop_event.is_set():
@@ -707,10 +844,18 @@ async def drop_watch_loop(
 
         now = time.time()
 
-        # --- Track 1: watched event IDs ---
-        if is_available():
+        # --- Aggressive mode: fast poll active targets ---
+        if AGGRESSIVE_ENABLED and _aggressive_targets:
+            try:
+                await _aggressive_poll_cycle(discord_post)
+            except Exception as e:
+                logger.warning("drop_catcher: aggressive poll error: %s", e)
+
+        # --- Track 1: watched event IDs (normal cadence) ---
+        if is_available() and (now - last_normal_poll) >= DROP_POLL_SECONDS:
             try:
                 await _poll_watched_events(discord_post)
+                last_normal_poll = time.time()
             except Exception as e:
                 logger.warning("drop_catcher: track-1 poll error: %s", e)
 
@@ -722,15 +867,21 @@ async def drop_watch_loop(
             except Exception as e:
                 logger.warning("drop_catcher: track-2 global scan error: %s", e)
 
-        # Sleep in small chunks for responsive shutdown
-        slept = 0
-        sleep_target = min(DROP_POLL_SECONDS, GLOBAL_SCAN_INTERVAL)
-        while slept < sleep_target:
-            if stop_event and stop_event.is_set():
-                return
-            chunk = min(15, sleep_target - slept)
-            await asyncio.sleep(chunk)
-            slept += chunk
+        # Sleep: short if aggressive targets active, normal otherwise
+        if AGGRESSIVE_ENABLED and _aggressive_targets:
+            await asyncio.sleep(AGGRESSIVE_POLL_SECONDS)
+        else:
+            slept = 0
+            sleep_target = min(DROP_POLL_SECONDS, GLOBAL_SCAN_INTERVAL)
+            while slept < sleep_target:
+                if stop_event and stop_event.is_set():
+                    return
+                # Wake up early if aggressive targets appear
+                if AGGRESSIVE_ENABLED and _aggressive_targets:
+                    break
+                chunk = min(15, sleep_target - slept)
+                await asyncio.sleep(chunk)
+                slept += chunk
 
 
 def _parse_sell_through(seatmap_txt: Optional[str]) -> float:
@@ -790,6 +941,18 @@ async def _poll_watched_events(discord_post: Callable[[Any], Awaitable[None]]) -
                 (new_status, now, new_name, new_url, new_price_min, new_price_max, event_id),
             )
             conn.commit()
+
+        # Auto-register aggressive target when on-sale is within AGGRESSIVE_WINDOW_SECS
+        if AGGRESSIVE_ENABLED and new_status not in ("onsale",):
+            onsale_unix = norm.get("onsale_start_unix")
+            if onsale_unix:
+                secs_until = onsale_unix - time.time()
+                if 0 < secs_until <= AGGRESSIVE_WINDOW_SECS:
+                    register_aggressive_target(event_id, onsale_unix, url=new_url)
+                    logger.info(
+                        "drop_catcher: auto-registered aggressive target %s (T-%ds)",
+                        event_id, int(secs_until),
+                    )
 
         if _is_dropped(old_status, new_status):
             # Try seatmap enrichment — also extracts sell_through for arbitrage

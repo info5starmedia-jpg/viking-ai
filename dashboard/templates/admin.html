@@ -16,8 +16,10 @@
     <nav class="sidebar-nav">
       <div class="nav-label">Admin</div>
       <a href="/admin" class="nav-link active"><span class="nav-icon">📊</span> Overview</a>
-      <a href="#invites" class="nav-link"><span class="nav-icon">🎟</span> Invite Codes</a>
-      <a href="#audit" class="nav-link"><span class="nav-icon">📋</span> Audit Log</a>
+      <a href="#invites"   class="nav-link"><span class="nav-icon">🎟</span> Invite Codes</a>
+      <a href="#hotpicks"  class="nav-link"><span class="nav-icon">🔥</span> Hot Picks</a>
+      <a href="#watchlist" class="nav-link"><span class="nav-icon">⭐</span> Global Watchlist</a>
+      <a href="#audit"     class="nav-link"><span class="nav-icon">📋</span> Audit Log</a>
       <div class="nav-label" style="margin-top:16px;">Client</div>
       <a href="/dashboard" class="nav-link"><span class="nav-icon">🎯</span> My Setup</a>
     </nav>
@@ -222,6 +224,110 @@
         </table>
         {% else %}
         <div class="empty-state"><div class="empty-icon">🎟</div>No invite codes yet.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Hot Picks -->
+    <div id="hotpicks" class="card">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">🔥</span> Hot Picks</span>
+        <span class="card-badge">{{ hot_picks|selectattr('active','equalto',1)|list|length }} active</span>
+      </div>
+      <div class="card-body" style="border-bottom:1px solid var(--border);">
+        <form action="/admin/hotpick/add" method="POST">
+          <div class="form-row" style="flex-wrap:wrap;">
+            <div class="form-group" style="flex:1;min-width:160px;">
+              <label>Artist</label>
+              <input type="text" name="artist" placeholder="e.g. Taylor Swift" required>
+            </div>
+            <div class="form-group" style="flex:2;min-width:200px;">
+              <label>Note (shown to all users)</label>
+              <input type="text" name="note" placeholder="e.g. Major tour going on sale soon!">
+            </div>
+            <div class="form-group" style="flex:1;min-width:160px;">
+              <label>Image URL (optional)</label>
+              <input type="url" name="image_url" placeholder="https://...">
+            </div>
+            <div class="form-group" style="align-self:flex-end;flex:0 0 auto;">
+              <button type="submit" class="btn btn-primary">+ Add</button>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="card-body no-pad">
+        {% if hot_picks %}
+        <table class="data-table">
+          <thead><tr><th>Artist</th><th>Note</th><th>Status</th><th>Added</th><th></th></tr></thead>
+          <tbody>
+          {% for pick in hot_picks %}
+          <tr style="{{ 'opacity:0.45;' if not pick.active }}">
+            <td style="font-weight:700;color:var(--accent);">{{ pick.artist }}</td>
+            <td style="font-size:.82rem;color:var(--text-muted);">{{ pick.note or '—' }}</td>
+            <td>{% if pick.active %}<span class="badge badge-green"><span class="badge-dot"></span>Active</span>
+                {% else %}<span class="badge badge-grey">Inactive</span>{% endif %}</td>
+            <td style="font-size:.78rem;color:var(--text-muted);">{{ pick.created_at|ts }}</td>
+            <td>{% if pick.active %}
+              <form action="/admin/hotpick/{{ pick.id }}/deactivate" method="POST" onsubmit="return confirm('Remove hot pick?')">
+                <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+              </form>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state"><div class="empty-icon">🔥</div>No hot picks yet. Flag artists above to alert all users.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Global Watchlist -->
+    <div id="watchlist" class="card">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">⭐</span> Global Watchlist</span>
+        <span class="card-badge">{{ global_watchlist|selectattr('active','equalto',1)|list|length }} active</span>
+      </div>
+      <div class="card-body" style="border-bottom:1px solid var(--border);">
+        <form action="/admin/watchlist/add" method="POST">
+          <div class="form-row">
+            <div class="form-group" style="flex:1;">
+              <label>Artist</label>
+              <input type="text" name="artist" placeholder="e.g. Beyoncé" required>
+            </div>
+            <div class="form-group" style="flex:2;">
+              <label>Note (internal)</label>
+              <input type="text" name="note" placeholder="Optional admin note">
+            </div>
+            <div class="form-group" style="align-self:flex-end;flex:0 0 auto;">
+              <button type="submit" class="btn btn-primary">+ Add</button>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="card-body no-pad">
+        {% if global_watchlist %}
+        <table class="data-table">
+          <thead><tr><th>Artist</th><th>Note</th><th>Status</th><th>Added</th><th></th></tr></thead>
+          <tbody>
+          {% for wl in global_watchlist %}
+          <tr style="{{ 'opacity:0.45;' if not wl.active }}">
+            <td style="font-weight:600;">{{ wl.artist }}</td>
+            <td style="font-size:.82rem;color:var(--text-muted);">{{ wl.note or '—' }}</td>
+            <td>{% if wl.active %}<span class="badge badge-green"><span class="badge-dot"></span>Active</span>
+                {% else %}<span class="badge badge-grey">Removed</span>{% endif %}</td>
+            <td style="font-size:.78rem;color:var(--text-muted);">{{ wl.created_at|ts }}</td>
+            <td>{% if wl.active %}
+              <form action="/admin/watchlist/remove/{{ wl.id }}" method="POST" onsubmit="return confirm('Remove?')">
+                <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+              </form>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state"><div class="empty-icon">⭐</div>No global watchlist entries. Add artists to monitor across all client dashboards.</div>
         {% endif %}
       </div>
     </div>

@@ -15,10 +15,11 @@
     </div>
     <nav class="sidebar-nav">
       <div class="nav-label">Setup</div>
-      <a href="#monitors" class="nav-link active"><span class="nav-icon">🎯</span> Monitors</a>
-      <a href="#proxies"  class="nav-link"><span class="nav-icon">🔀</span> Proxies</a>
-      <a href="#webhook"  class="nav-link"><span class="nav-icon">🔔</span> Discord Webhook</a>
-      <a href="/redeem"   class="nav-link"><span class="nav-icon">🎟</span> Redeem Code</a>
+      <a href="#monitors"  class="nav-link active"><span class="nav-icon">🎯</span> Monitors</a>
+      <a href="#watchlist" class="nav-link"><span class="nav-icon">⭐</span> Watchlist</a>
+      <a href="#proxies"   class="nav-link"><span class="nav-icon">🔀</span> Proxies</a>
+      <a href="#webhook"   class="nav-link"><span class="nav-icon">🔔</span> Discord Webhook</a>
+      <a href="/redeem"    class="nav-link"><span class="nav-icon">🎟</span> Redeem Code</a>
       {% if is_admin %}
       <div class="nav-label" style="margin-top:16px;">Admin</div>
       <a href="/admin" class="nav-link"><span class="nav-icon">📊</span> Overview</a>
@@ -71,10 +72,35 @@
         </div>{% endfor %}</div>{% endif %}
     {% endwith %}
 
+    <!-- HOT PICKS (admin-flagged) -->
+    {% if hot_picks %}
+    <div id="hotpicks" class="card" style="border-color:var(--accent);">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">🔥</span> Hot Picks</span>
+        <span class="card-badge badge-yellow">{{ hot_picks|length }} flagged</span>
+      </div>
+      <div class="card-body no-pad">
+        <div style="display:flex;flex-wrap:wrap;gap:12px;padding:16px;">
+          {% for pick in hot_picks %}
+          <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px 16px;min-width:160px;max-width:220px;flex:1;">
+            {% if pick.image_url %}
+            <img src="{{ pick.image_url }}" alt="{{ pick.artist }}" style="width:100%;height:80px;object-fit:cover;border-radius:4px;margin-bottom:8px;">
+            {% endif %}
+            <div style="font-weight:700;color:var(--accent);font-size:.9rem;">{{ pick.artist }}</div>
+            {% if pick.note %}
+            <div style="font-size:.75rem;color:var(--text-muted);margin-top:4px;line-height:1.4;">{{ pick.note }}</div>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
     <!-- MONITORS -->
     <div id="monitors" class="card">
       <div class="card-header">
-        <span class="card-title"><span class="icon">🎯</span> Ticketmaster URLs to Monitor</span>
+        <span class="card-title"><span class="icon">🎯</span> URL Monitors</span>
         <span class="card-badge">{{ monitors|length }}{% if monitor_limit is not none %}/{{ monitor_limit }}{% endif %} active</span>
       </div>
 
@@ -83,9 +109,10 @@
         <form action="/api/monitor/add" method="POST">
           <div class="form-row">
             <div class="form-group" style="flex:2;min-width:200px;">
-              <label for="url">Ticketmaster URL</label>
+              <label for="url">URL <span style="color:var(--text-muted);font-weight:400;">(Ticketmaster, SeatGeek, StubHub, or VividSeats)</span></label>
               <input type="url" id="url" name="url" class="input-mono"
-                     placeholder="https://www.ticketmaster.com/event/..." required>
+                     placeholder="https://www.ticketmaster.com/event/..." required
+                     oninput="updatePlatformBadge(this.value)">
             </div>
             <div class="form-group" style="flex:1;">
               <label for="label">Label (optional)</label>
@@ -94,6 +121,9 @@
             <div class="form-group" style="align-self:flex-end;flex:0 0 auto;">
               <button type="submit" class="btn btn-primary">+ Add Monitor</button>
             </div>
+          </div>
+          <div id="platform-badge-row" style="display:none;margin-top:6px;">
+            <span id="platform-badge" class="badge badge-grey" style="font-size:.72rem;"></span>
           </div>
         </form>
       </div>
@@ -109,12 +139,19 @@
       <div class="card-body no-pad">
         {% if monitors %}
         <table class="data-table">
-          <thead><tr><th>Label</th><th>URL</th><th>Status</th><th>Alerts</th><th></th></tr></thead>
+          <thead><tr><th>Label</th><th>URL</th><th>Platform</th><th>Status</th><th>Alerts</th><th></th></tr></thead>
           <tbody>
           {% for m in monitors %}
           <tr>
             <td>{{ m.label or '—' }}</td>
             <td><a href="{{ m.url }}" target="_blank" rel="noopener" class="cell-url" title="{{ m.url }}">{{ m.url }}</a></td>
+            <td>
+              {% set p = m.platform or 'ticketmaster' %}
+              {% if p == 'seatgeek' %}<span class="badge badge-green" style="font-size:.68rem;">SeatGeek</span>
+              {% elif p == 'stubhub' %}<span class="badge badge-yellow" style="font-size:.68rem;">StubHub</span>
+              {% elif p == 'vividseats' %}<span class="badge" style="background:#7b3f9e;color:#fff;font-size:.68rem;">VividSeats</span>
+              {% else %}<span class="badge badge-grey" style="font-size:.68rem;">TM</span>{% endif %}
+            </td>
             <td>
               {% if m.last_status == 'onsale' %}<span class="badge badge-green"><span class="badge-dot"></span>On Sale</span>
               {% elif m.last_status == 'offsale' %}<span class="badge badge-red"><span class="badge-dot"></span>Off Sale</span>
@@ -134,6 +171,69 @@
         <div class="empty-state">
           <div class="empty-icon">🎯</div>
           No monitors yet. Paste a Ticketmaster URL above to start watching.
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- WATCHLIST -->
+    <div id="watchlist" class="card">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">⭐</span> My Watchlist</span>
+        <span class="card-badge">
+          {{ personal_watchlist|length }}{% if watchlist_limit is not none %}/{{ watchlist_limit }}{% endif %} artists
+        </span>
+      </div>
+
+      {% if watchlist_limit is none or personal_watchlist|length < watchlist_limit %}
+      <div class="card-body" style="border-bottom:1px solid var(--border);">
+        <form action="/api/watchlist/add" method="POST">
+          <div class="form-row">
+            <div class="form-group" style="flex:1;">
+              <label for="watchlist-artist">Artist Name</label>
+              <input type="text" id="watchlist-artist" name="artist"
+                     placeholder="e.g. Taylor Swift" required>
+            </div>
+            <div class="form-group" style="align-self:flex-end;flex:0 0 auto;">
+              <button type="submit" class="btn btn-primary">+ Watch Artist</button>
+            </div>
+          </div>
+        </form>
+        <p style="font-size:.75rem;color:var(--text-muted);margin-top:8px;">
+          Get notified when watched artists drop new tickets across all platforms.
+        </p>
+      </div>
+      {% else %}
+      <div class="card-body" style="border-bottom:1px solid var(--border);">
+        <div class="flash flash-info">
+          ℹ Your {{ sub.tier|title }} plan allows {{ watchlist_limit }} watchlist entries.
+          <a href="/redeem" style="color:var(--accent);margin-left:6px;">Upgrade →</a>
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="card-body no-pad">
+        {% if personal_watchlist %}
+        <table class="data-table">
+          <thead><tr><th>Artist</th><th>Added</th><th></th></tr></thead>
+          <tbody>
+          {% for w in personal_watchlist %}
+          <tr>
+            <td style="font-weight:600;">{{ w.artist }}</td>
+            <td style="color:var(--text-muted);font-size:.8rem;">{{ w.added_at|ts }}</td>
+            <td>
+              <form action="/api/watchlist/remove/{{ w.id }}" method="POST" onsubmit="return confirm('Remove?')">
+                <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state">
+          <div class="empty-icon">⭐</div>
+          No artists on your watchlist yet. Add one above to get cross-platform alerts.
         </div>
         {% endif %}
       </div>
@@ -218,7 +318,7 @@
 </div>
 
 <script>
-  const sections = ['monitors','proxies','webhook'];
+  const sections = ['monitors','watchlist','proxies','webhook'];
   const links = {};
   sections.forEach(id => { links[id] = document.querySelector(`.nav-link[href="#${id}"]`); });
   const observer = new IntersectionObserver(entries => {
@@ -230,6 +330,23 @@
     });
   }, { threshold: 0.4 });
   sections.forEach(id => { const el = document.getElementById(id); if (el) observer.observe(el); });
+
+  // Platform detection badge on URL input
+  function updatePlatformBadge(url) {
+    const badge = document.getElementById('platform-badge');
+    const row   = document.getElementById('platform-badge-row');
+    if (!badge || !row) return;
+    const u = url.toLowerCase();
+    let label = '', cls = 'badge-grey';
+    if (u.includes('seatgeek.com'))    { label = '🟢 SeatGeek detected'; cls = 'badge-green'; }
+    else if (u.includes('stubhub.com'))    { label = '🟡 StubHub detected'; cls = 'badge-yellow'; }
+    else if (u.includes('vividseats.com')) { label = '🟣 VividSeats detected'; cls = 'badge badge-grey'; badge.style.background='#7b3f9e';badge.style.color='#fff'; }
+    else if (u.includes('ticketmaster.com') || u.length > 5) { label = '⚪ Ticketmaster'; cls = 'badge-grey'; badge.style.background='';badge.style.color=''; }
+    else { row.style.display = 'none'; return; }
+    badge.className = 'badge ' + cls;
+    badge.textContent = label;
+    row.style.display = 'block';
+  }
 </script>
 </body>
 </html>

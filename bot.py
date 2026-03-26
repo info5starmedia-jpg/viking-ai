@@ -107,6 +107,7 @@ verified_fan_monitor = _try_import("verified_fan_monitor")
 tour_scan_monitor = _try_import("tour_scan_monitor")
 tm_surge_watch = _try_import("tm_surge_watch")
 drop_catcher = _try_import("drop_catcher")
+platform_monitor = _try_import("platform_monitor")
 usage_db = _try_import("usage_db")
 
 ticketmaster_agent = _try_import("ticketmaster_agent")
@@ -950,6 +951,39 @@ async def _start_drop_catcher() -> None:
     logger.info("Drop catcher loop started (%ss).", DROP_CATCHER_POLL_SECONDS)
 
 
+async def _start_platform_monitor() -> None:
+    if platform_monitor is None:
+        logger.info("platform_monitor not available; skipping.")
+        return
+    if not getattr(platform_monitor, "is_available", lambda: False)():
+        logger.info("platform_monitor: requests or db unavailable; skipping.")
+        return
+
+    async def _platform_discord_post(payload) -> None:
+        if isinstance(payload, dict):
+            try:
+                embed, view = build_alert(payload, link_only=False)
+                role_id = os.getenv("DROP_PING_ROLE_ID", "")
+                content = f"<@&{role_id}>" if role_id else ""
+                await post_rich(embed, view, content=content, prefer="drop")
+            except Exception as e:
+                logger.warning("platform_monitor embed build failed: %s", e)
+                await post_message(payload.get("text", str(payload)), prefer="drop")
+        else:
+            await post_message(str(payload), prefer="drop")
+        STATUS["last_posts"]["drop_catcher_unix"] = time.time()
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        platform_monitor.platform_watch_loop(
+            discord_post=_platform_discord_post, stop_event=stop_event
+        ),
+        name="platform_monitor",
+    )
+    _task_guard("platform_monitor", task)
+    logger.info("Platform monitor loop started.")
+
+
 async def _daily_digest_loop() -> None:
     """
     Posts a morning digest of today's US/CA music on-sales once per day
@@ -1312,6 +1346,37 @@ async def drop_remove_cmd(interaction: discord.Interaction, event_id: str) -> No
         await interaction.followup.send(f"❌ drop_remove failed: {e}", ephemeral=True)
 
 
+@tree.command(name="drop_aggressive", description="Manually register an event for aggressive 3s polling before its on-sale time.")
+@app_commands.describe(
+    event_id="TM event ID to target",
+    onsale_in_minutes="Minutes until on-sale starts (e.g. 10 means T-10min from now)",
+    event_url="Direct link to the event (optional, used for pre-warming)",
+)
+async def drop_aggressive_cmd(
+    interaction: discord.Interaction,
+    event_id: str,
+    onsale_in_minutes: float,
+    event_url: Optional[str] = "",
+) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if not drop_catcher or not hasattr(drop_catcher, "register_aggressive_target"):
+        await interaction.followup.send("❌ drop_catcher not available.", ephemeral=True)
+        return
+    if onsale_in_minutes <= 0:
+        await interaction.followup.send("❌ onsale_in_minutes must be > 0.", ephemeral=True)
+        return
+    try:
+        onsale_unix = time.time() + onsale_in_minutes * 60
+        drop_catcher.register_aggressive_target(event_id.strip(), onsale_unix, url=event_url or "")
+        await interaction.followup.send(
+            f"✅ Aggressive mode armed for `{event_id}` — on-sale in **{onsale_in_minutes:.0f} min**.\n"
+            f"Polling every {drop_catcher.AGGRESSIVE_POLL_SECONDS}s. Pre-warm fires at T-60s.",
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ drop_aggressive failed: {e}", ephemeral=True)
+
+
 @tree.command(name="drop_search", description="Search Ticketmaster events by artist then watch one for drops.")
 @app_commands.describe(artist="Artist name to search", limit="Max results (default 8)")
 async def drop_search_cmd(interaction: discord.Interaction, artist: str, limit: Optional[int] = 8) -> None:
@@ -1590,6 +1655,9 @@ async def on_ready() -> None:
 
     # Start drop catcher loop (async)
     await _start_drop_catcher()
+
+    # Start multi-platform monitor loop (async)
+    await _start_platform_monitor()
 
     # Daily drop digest loop
     t_digest = asyncio.create_task(_daily_digest_loop(), name="daily_digest")

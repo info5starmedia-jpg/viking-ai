@@ -21,6 +21,13 @@ TIER_LIMITS: Dict[str, Optional[int]] = {
     "unlimited": None,
 }
 
+WATCHLIST_LIMITS: Dict[str, Optional[int]] = {
+    "tester":    5,
+    "starter":   20,
+    "pro":       50,
+    "unlimited": None,
+}
+
 TIER_PRICES = {
     "tester":    0,
     "starter":   80,
@@ -111,7 +118,43 @@ def init_db() -> None:
                 detail     TEXT,
                 created_at REAL
             );
+
+            CREATE TABLE IF NOT EXISTS dc_watchlist_global (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                artist     TEXT NOT NULL,
+                note       TEXT DEFAULT '',
+                image_url  TEXT DEFAULT '',
+                active     INTEGER DEFAULT 1,
+                created_at REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS dc_watchlist_personal (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id  INTEGER NOT NULL REFERENCES dc_clients(id) ON DELETE CASCADE,
+                artist     TEXT NOT NULL,
+                added_at   REAL,
+                UNIQUE(client_id, artist)
+            );
+
+            CREATE TABLE IF NOT EXISTS dc_hot_picks (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                artist     TEXT NOT NULL,
+                note       TEXT DEFAULT '',
+                image_url  TEXT DEFAULT '',
+                active     INTEGER DEFAULT 1,
+                created_at REAL
+            );
         """)
+        # Migrate dc_monitors with new columns (ALTER TABLE doesn't support IF NOT EXISTS)
+        for col, definition in [
+            ("platform",       "TEXT NOT NULL DEFAULT 'ticketmaster'"),
+            ("last_price_min", "REAL"),
+            ("last_price_max", "REAL"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE dc_monitors ADD COLUMN {col} {definition}")
+            except Exception:
+                pass  # column already exists
         conn.commit()
 
 
@@ -477,11 +520,12 @@ def get_monitors(client_id: int) -> List[sqlite3.Row]:
         ).fetchall()
 
 
-def add_monitor(client_id: int, url: str, label: str, discord_webhook: str) -> None:
+def add_monitor(client_id: int, url: str, label: str, discord_webhook: str,
+                platform: str = "ticketmaster") -> None:
     with connect() as conn:
         conn.execute(
-            "INSERT INTO dc_monitors (client_id, url, label, discord_webhook, created_at) VALUES (?,?,?,?,?)",
-            (client_id, url, label or "", discord_webhook or "", time.time()),
+            "INSERT INTO dc_monitors (client_id, url, label, discord_webhook, platform, created_at) VALUES (?,?,?,?,?,?)",
+            (client_id, url, label or "", discord_webhook or "", platform, time.time()),
         )
         conn.commit()
 
@@ -605,6 +649,164 @@ def get_admin_stats() -> Dict[str, Any]:
         "audit_log": [dict(r) for r in audit_log],
         "tier_counts": {r["tier"]: r["cnt"] for r in tier_counts},
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: platform column helper on monitors
+# ---------------------------------------------------------------------------
+
+def update_monitor_price(monitor_id: int, price_min: Optional[float], price_max: Optional[float]) -> None:
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dc_monitors SET last_price_min=?, last_price_max=?, last_checked=? WHERE id=?",
+            (price_min, price_max, now, monitor_id),
+        )
+        conn.commit()
+
+
+def get_monitors_by_platform(platform: str) -> List[Dict[str, Any]]:
+    """Return all active monitors for a given platform, with their proxies."""
+    with connect() as conn:
+        monitors = conn.execute(
+            """
+            SELECT m.*, c.active as client_active
+            FROM dc_monitors m
+            JOIN dc_clients c ON c.id = m.client_id
+            WHERE m.active=1 AND c.active=1 AND m.platform=?
+            """,
+            (platform,),
+        ).fetchall()
+        result = []
+        for m in monitors:
+            proxies = conn.execute(
+                "SELECT proxy FROM dc_proxies WHERE client_id=?", (m["client_id"],)
+            ).fetchall()
+            result.append({**dict(m), "proxies": [p["proxy"] for p in proxies]})
+    return result
+
+
+def increment_monitor_alert_count(monitor_id: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dc_monitors SET alert_count = alert_count + 1 WHERE id=?", (monitor_id,)
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Watchlist (personal)
+# ---------------------------------------------------------------------------
+
+def get_watchlist_limit(client_id: int) -> Optional[int]:
+    tier = get_tier(client_id)
+    return WATCHLIST_LIMITS.get(tier)
+
+
+def get_personal_watchlist(client_id: int) -> List[Dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM dc_watchlist_personal WHERE client_id=? ORDER BY added_at DESC",
+            (client_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_personal_watchlist(client_id: int, artist: str) -> tuple[bool, str]:
+    artist = (artist or "").strip()
+    if not artist:
+        return False, "Artist name is required."
+    limit = get_watchlist_limit(client_id)
+    now = time.time()
+    with connect() as conn:
+        if limit is not None:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM dc_watchlist_personal WHERE client_id=?", (client_id,)
+            ).fetchone()[0]
+            if count >= limit:
+                return False, f"Your plan allows {limit} watchlist entries. Upgrade to add more."
+        try:
+            conn.execute(
+                "INSERT INTO dc_watchlist_personal (client_id, artist, added_at) VALUES (?,?,?)",
+                (client_id, artist, now),
+            )
+            conn.commit()
+        except Exception:
+            return False, f"{artist} is already on your watchlist."
+    return True, f"{artist} added to your watchlist."
+
+
+def remove_personal_watchlist(entry_id: int, client_id: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "DELETE FROM dc_watchlist_personal WHERE id=? AND client_id=?",
+            (entry_id, client_id),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Global watchlist (admin-managed)
+# ---------------------------------------------------------------------------
+
+def get_global_watchlist(active_only: bool = True) -> List[Dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM dc_watchlist_global" + (" WHERE active=1" if active_only else "") + " ORDER BY created_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def admin_add_global_watchlist(artist: str, note: str = "", image_url: str = "") -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO dc_watchlist_global (artist, note, image_url, created_at) VALUES (?,?,?,?)",
+            (artist.strip(), note[:200], image_url, time.time()),
+        )
+        conn.commit()
+
+
+def admin_remove_global_watchlist(wl_id: int, admin_name: str = "admin") -> None:
+    now = time.time()
+    with connect() as conn:
+        conn.execute("DELETE FROM dc_watchlist_global WHERE id=?", (wl_id,))
+        conn.execute(
+            "INSERT INTO dc_audit_log (admin_name, action, target, detail, created_at) VALUES (?,?,?,?,?)",
+            (admin_name, "remove_global_watchlist", str(wl_id), "", now),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Hot picks (admin-flagged, shown on all dashboards)
+# ---------------------------------------------------------------------------
+
+def get_hot_picks(active_only: bool = True) -> List[Dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM dc_hot_picks" + (" WHERE active=1" if active_only else "") + " ORDER BY created_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def admin_add_hot_pick(artist: str, note: str = "", image_url: str = "") -> None:
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO dc_hot_picks (artist, note, image_url, created_at) VALUES (?,?,?,?)",
+            (artist.strip(), note[:300], image_url, time.time()),
+        )
+        conn.commit()
+
+
+def admin_deactivate_hot_pick(pick_id: int, admin_name: str = "admin") -> None:
+    now = time.time()
+    with connect() as conn:
+        conn.execute("UPDATE dc_hot_picks SET active=0 WHERE id=?", (pick_id,))
+        conn.execute(
+            "INSERT INTO dc_audit_log (admin_name, action, target, detail, created_at) VALUES (?,?,?,?,?)",
+            (admin_name, "deactivate_hot_pick", str(pick_id), "", now),
+        )
+        conn.commit()
 
 
 def toggle_client(client_id: int, active: int) -> None:
