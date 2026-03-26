@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Redeem Code — Viking AI</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="app-layout">
+
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <span class="logo-icon">⚡</span><span>Viking AI</span>
+    </div>
+    <nav class="sidebar-nav">
+      <div class="nav-label">Setup</div>
+      <a href="/dashboard" class="nav-link"><span class="nav-icon">🎯</span> Monitors</a>
+      <a href="/redeem" class="nav-link active"><span class="nav-icon">🎟</span> Redeem Code</a>
+      {% if is_admin %}
+      <div class="nav-label" style="margin-top:16px;">Admin</div>
+      <a href="/admin" class="nav-link"><span class="nav-icon">📊</span> Overview</a>
+      {% endif %}
+    </nav>
+    <div class="sidebar-user">
+      {% if user.avatar_url %}<img src="{{ user.avatar_url }}" alt="avatar" class="user-avatar">
+      {% else %}<div class="user-avatar-placeholder">{{ user.display_name[0]|upper }}</div>{% endif %}
+      <div class="user-info">
+        <div class="user-name">{{ user.display_name }}</div>
+        <div class="user-email">{{ user.email or 'No email' }}</div>
+      </div>
+      <a href="/logout" class="logout-btn">↩</a>
+    </div>
+  </aside>
+
+  <main class="main-content" style="max-width:520px;">
+
+    <div class="page-header">
+      <h1 class="page-title">Redeem Invite Code</h1>
+      <p class="page-subtitle">Enter a code to activate or upgrade your plan.</p>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}<div class="flash-container">{% for cat, msg in messages %}
+        <div class="flash flash-{{ 'error' if cat=='error' else 'success' if cat=='success' else 'info' }}">
+          {{ '✓' if cat=='success' else '⚠' if cat=='error' else 'ℹ' }} {{ msg }}
+        </div>{% endfor %}</div>{% endif %}
+    {% endwith %}
+
+    <!-- Current plan -->
+    {% if sub %}
+    <div class="card" style="margin-bottom:20px;">
+      <div class="card-body">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <div style="font-size:.75rem;color:var(--text-muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.05em;">Current Plan</div>
+            <div style="font-size:1.1rem;font-weight:700;color:#fff;">{{ sub.tier|title }}</div>
+          </div>
+          <span class="badge {% if sub.status in ('active','trialing') %}badge-green{% else %}badge-red{% endif %}">
+            <span class="badge-dot"></span>{{ sub.status|title }}
+          </span>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Redeem form -->
+    <div class="card">
+      <div class="card-header"><span class="card-title"><span class="icon">🎟</span> Enter Code</span></div>
+      <div class="card-body">
+        <form action="/api/invite/redeem" method="POST">
+          <div class="form-group" style="margin-bottom:16px;">
+            <label for="code">Invite Code</label>
+            <input type="text" id="code" name="code" class="input-mono"
+                   placeholder="XXXXXXXXXXXX"
+                   style="text-transform:uppercase;font-size:1rem;letter-spacing:.08em;text-align:center;"
+                   autocomplete="off" required>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center;padding:12px;">
+            Redeem Code
+          </button>
+        </form>
+        <p style="font-size:.78rem;color:var(--text-muted);text-align:center;margin-top:14px;line-height:1.5;">
+          Codes are provided by the admin. Each code can only be redeemed once per account.
+        </p>
+      </div>
+    </div>
+
+  </main>
+</div>
+</body>
+</html>

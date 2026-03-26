@@ -6,11 +6,27 @@ Extends the existing VIKING_DB_PATH database with dashboard-specific tables.
 from __future__ import annotations
 
 import os
+import secrets
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
 DB_PATH = os.getenv("VIKING_DB_PATH", "/opt/viking-ai/viking_ai.sqlite")
+
+# Tier monitor limits (None = unlimited)
+TIER_LIMITS: Dict[str, Optional[int]] = {
+    "tester":    None,   # unlimited monitors, checkout blocked in app layer
+    "starter":   7,
+    "pro":       15,
+    "unlimited": None,
+}
+
+TIER_PRICES = {
+    "tester":    0,
+    "starter":   80,
+    "pro":       100,
+    "unlimited": 300,
+}
 
 
 def connect() -> sqlite3.Connection:
@@ -53,6 +69,47 @@ def init_db() -> None:
                 alert_count     INTEGER DEFAULT 0,
                 active          INTEGER DEFAULT 1,
                 created_at      REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS dc_subscriptions (
+                id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id              INTEGER NOT NULL REFERENCES dc_clients(id) ON DELETE CASCADE,
+                tier                   TEXT NOT NULL DEFAULT 'tester',
+                status                 TEXT NOT NULL DEFAULT 'active',
+                stripe_customer_id     TEXT,
+                stripe_subscription_id TEXT,
+                current_period_end     REAL,
+                extra_days             INTEGER DEFAULT 0,
+                created_at             REAL,
+                updated_at             REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS dc_invite_codes (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                code         TEXT NOT NULL UNIQUE,
+                tier         TEXT NOT NULL DEFAULT 'tester',
+                max_uses     INTEGER NOT NULL DEFAULT 1,
+                uses_count   INTEGER NOT NULL DEFAULT 0,
+                expires_at   REAL,
+                note         TEXT DEFAULT '',
+                active       INTEGER DEFAULT 1,
+                created_at   REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS dc_invite_redemptions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                code        TEXT NOT NULL,
+                client_id   INTEGER NOT NULL REFERENCES dc_clients(id) ON DELETE CASCADE,
+                redeemed_at REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS dc_audit_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_name TEXT,
+                action     TEXT NOT NULL,
+                target     TEXT,
+                detail     TEXT,
+                created_at REAL
             );
         """)
         conn.commit()
@@ -114,6 +171,268 @@ def get_client(client_id: int) -> Optional[sqlite3.Row]:
         return conn.execute(
             "SELECT * FROM dc_clients WHERE id=?", (client_id,)
         ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Subscriptions
+# ---------------------------------------------------------------------------
+
+def get_subscription(client_id: int) -> Optional[Dict[str, Any]]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM dc_subscriptions WHERE client_id=? ORDER BY id DESC LIMIT 1",
+            (client_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def ensure_subscription(client_id: int) -> Dict[str, Any]:
+    """Return subscription for client, creating a tester one if none exists."""
+    sub = get_subscription(client_id)
+    if not sub:
+        now = time.time()
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO dc_subscriptions (client_id, tier, status, created_at, updated_at) VALUES (?,?,?,?,?)",
+                (client_id, "tester", "active", now, now),
+            )
+            conn.commit()
+        sub = get_subscription(client_id)
+    return sub
+
+
+def is_subscription_active(client_id: int) -> bool:
+    """True if client has an active subscription (not expired/past_due/canceled)."""
+    sub = get_subscription(client_id)
+    if not sub:
+        return False
+    if sub["status"] not in ("active", "trialing"):
+        return False
+    # Check period end — if set and past, expired
+    period_end = sub.get("current_period_end")
+    if period_end:
+        extra = sub.get("extra_days", 0) or 0
+        effective_end = period_end + (extra * 86400)
+        if time.time() > effective_end:
+            return False
+    return True
+
+
+def get_tier(client_id: int) -> str:
+    sub = get_subscription(client_id)
+    return sub["tier"] if sub else "tester"
+
+
+def get_monitor_limit(client_id: int) -> Optional[int]:
+    """Return max monitors allowed for this client's tier. None = unlimited."""
+    tier = get_tier(client_id)
+    return TIER_LIMITS.get(tier)
+
+
+def upsert_subscription_from_stripe(
+    stripe_customer_id: str,
+    stripe_subscription_id: str,
+    tier: str,
+    status: str,
+    current_period_end: float,
+) -> None:
+    now = time.time()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, client_id FROM dc_subscriptions WHERE stripe_subscription_id=?",
+            (stripe_subscription_id,),
+        ).fetchone()
+        if row:
+            conn.execute(
+                """UPDATE dc_subscriptions
+                   SET tier=?, status=?, current_period_end=?, updated_at=?
+                   WHERE id=?""",
+                (tier, status, current_period_end, now, row["id"]),
+            )
+        else:
+            # Find client by stripe customer ID
+            sub_row = conn.execute(
+                "SELECT client_id FROM dc_subscriptions WHERE stripe_customer_id=? LIMIT 1",
+                (stripe_customer_id,),
+            ).fetchone()
+            if sub_row:
+                conn.execute(
+                    """INSERT INTO dc_subscriptions
+                       (client_id, tier, status, stripe_customer_id, stripe_subscription_id,
+                        current_period_end, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (sub_row["client_id"], tier, status, stripe_customer_id,
+                     stripe_subscription_id, current_period_end, now, now),
+                )
+        conn.commit()
+
+
+def set_subscription_status(client_id: int, status: str) -> None:
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dc_subscriptions SET status=?, updated_at=? WHERE client_id=?",
+            (status, now, client_id),
+        )
+        conn.commit()
+
+
+def admin_set_tier(client_id: int, tier: str, admin_name: str = "admin") -> None:
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dc_subscriptions SET tier=?, updated_at=? WHERE client_id=?",
+            (tier, now, client_id),
+        )
+        conn.execute(
+            "INSERT INTO dc_audit_log (admin_name, action, target, detail, created_at) VALUES (?,?,?,?,?)",
+            (admin_name, "set_tier", str(client_id), f"tier={tier}", now),
+        )
+        conn.commit()
+
+
+def admin_add_days(client_id: int, days: int, admin_name: str = "admin") -> None:
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dc_subscriptions SET extra_days = COALESCE(extra_days,0) + ?, updated_at=? WHERE client_id=?",
+            (days, now, client_id),
+        )
+        conn.execute(
+            "INSERT INTO dc_audit_log (admin_name, action, target, detail, created_at) VALUES (?,?,?,?,?)",
+            (admin_name, "add_days", str(client_id), f"days={days}", now),
+        )
+        conn.commit()
+
+
+def admin_pause_monitors(client_id: int, paused: int, admin_name: str = "admin") -> None:
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dc_monitors SET active=? WHERE client_id=?",
+            (0 if paused else 1, client_id),
+        )
+        conn.execute(
+            "INSERT INTO dc_audit_log (admin_name, action, target, detail, created_at) VALUES (?,?,?,?,?)",
+            (admin_name, "pause_monitors" if paused else "resume_monitors", str(client_id), "", now),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Invite codes
+# ---------------------------------------------------------------------------
+
+def create_invite_code(
+    tier: str = "tester",
+    max_uses: int = 1,
+    expires_days: Optional[int] = None,
+    note: str = "",
+) -> str:
+    code = secrets.token_urlsafe(12)
+    expires_at = (time.time() + expires_days * 86400) if expires_days else None
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO dc_invite_codes (code, tier, max_uses, expires_at, note, created_at) VALUES (?,?,?,?,?,?)",
+            (code, tier, max_uses, expires_at, note, time.time()),
+        )
+        conn.commit()
+    return code
+
+
+def get_invite_code(code: str) -> Optional[Dict[str, Any]]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM dc_invite_codes WHERE code=?", (code,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_invite_codes() -> List[Dict[str, Any]]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM dc_invite_codes ORDER BY created_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def redeem_invite_code(code: str, client_id: int) -> tuple[bool, str]:
+    """
+    Validate and redeem an invite code for a client.
+    Returns (success, message).
+    """
+    now = time.time()
+    with connect() as conn:
+        ic = conn.execute(
+            "SELECT * FROM dc_invite_codes WHERE code=?", (code,)
+        ).fetchone()
+        if not ic:
+            return False, "Invalid invite code."
+        if not ic["active"]:
+            return False, "This invite code has been deactivated."
+        if ic["expires_at"] and now > ic["expires_at"]:
+            return False, "This invite code has expired."
+        if ic["uses_count"] >= ic["max_uses"]:
+            return False, "This invite code has no uses remaining."
+        # Check not already redeemed by this client
+        already = conn.execute(
+            "SELECT id FROM dc_invite_redemptions WHERE code=? AND client_id=?",
+            (code, client_id),
+        ).fetchone()
+        if already:
+            return False, "You have already redeemed this invite code."
+
+        # Redeem
+        conn.execute(
+            "UPDATE dc_invite_codes SET uses_count = uses_count + 1 WHERE code=?", (code,)
+        )
+        conn.execute(
+            "INSERT INTO dc_invite_redemptions (code, client_id, redeemed_at) VALUES (?,?,?)",
+            (code, client_id, now),
+        )
+        # Apply tier to subscription
+        sub = conn.execute(
+            "SELECT id FROM dc_subscriptions WHERE client_id=?", (client_id,)
+        ).fetchone()
+        if sub:
+            conn.execute(
+                "UPDATE dc_subscriptions SET tier=?, status='active', updated_at=? WHERE client_id=?",
+                (ic["tier"], now, client_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO dc_subscriptions (client_id, tier, status, created_at, updated_at) VALUES (?,?,?,?,?)",
+                (client_id, ic["tier"], "active", now, now),
+            )
+        conn.commit()
+    return True, f"Invite code redeemed — you are now on the {ic['tier'].title()} plan."
+
+
+def deactivate_invite_code(code: str, admin_name: str = "admin") -> None:
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dc_invite_codes SET active=0 WHERE code=?", (code,)
+        )
+        conn.execute(
+            "INSERT INTO dc_audit_log (admin_name, action, target, detail, created_at) VALUES (?,?,?,?,?)",
+            (admin_name, "deactivate_code", code, "", now),
+        )
+        conn.commit()
+
+
+def extend_invite_code(code: str, extra_days: int, admin_name: str = "admin") -> None:
+    now = time.time()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE dc_invite_codes SET expires_at = COALESCE(expires_at, ?) + ? WHERE code=?",
+            (now, extra_days * 86400, code),
+        )
+        conn.execute(
+            "INSERT INTO dc_audit_log (admin_name, action, target, detail, created_at) VALUES (?,?,?,?,?)",
+            (admin_name, "extend_code", code, f"days={extra_days}", now),
+        )
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -187,9 +506,7 @@ def set_global_webhook(client_id: int, discord_webhook: str) -> None:
 
 
 def get_active_monitors_for_bot() -> List[Dict[str, Any]]:
-    """
-    Return all active monitors with their proxy list — consumed by drop_catcher loop.
-    """
+    """Return all active monitors with their proxy list — consumed by drop_catcher loop."""
     with connect() as conn:
         monitors = conn.execute(
             "SELECT m.*, c.active as client_active FROM dc_monitors m "
@@ -201,11 +518,34 @@ def get_active_monitors_for_bot() -> List[Dict[str, Any]]:
             proxies = conn.execute(
                 "SELECT proxy FROM dc_proxies WHERE client_id=?", (m["client_id"],)
             ).fetchall()
-            result.append({
-                **dict(m),
-                "proxies": [p["proxy"] for p in proxies],
-            })
+            result.append({**dict(m), "proxies": [p["proxy"] for p in proxies]})
     return result
+
+
+# ---------------------------------------------------------------------------
+# Expiry warnings — called by bot scheduler
+# ---------------------------------------------------------------------------
+
+def get_clients_expiring_in(days: int) -> List[Dict[str, Any]]:
+    """Return active clients whose subscription expires in exactly `days` days (±12h window)."""
+    now = time.time()
+    window_start = now + (days * 86400) - 43200  # 12h before
+    window_end   = now + (days * 86400) + 43200  # 12h after
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.id, c.discord_id, c.display_name, c.email,
+                   s.tier, s.current_period_end, s.extra_days
+            FROM dc_clients c
+            JOIN dc_subscriptions s ON s.client_id = c.id
+            WHERE c.active = 1
+              AND s.status IN ('active','trialing')
+              AND (s.current_period_end + COALESCE(s.extra_days,0)*86400)
+                  BETWEEN ? AND ?
+            """,
+            (window_start, window_end),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -223,21 +563,37 @@ def get_admin_stats() -> Dict[str, Any]:
         top_urls = conn.execute(
             """
             SELECT url, COUNT(DISTINCT client_id) as client_count
-            FROM dc_monitors
-            WHERE active=1
-            GROUP BY url
-            ORDER BY client_count DESC
-            LIMIT 5
+            FROM dc_monitors WHERE active=1
+            GROUP BY url ORDER BY client_count DESC LIMIT 5
             """
         ).fetchall()
         all_clients = conn.execute(
             """
             SELECT
                 c.id, c.display_name, c.email, c.created_at, c.last_login, c.active,
+                COALESCE(s.tier,'tester')   as tier,
+                COALESCE(s.status,'none')   as sub_status,
+                s.current_period_end,
+                s.extra_days,
                 (SELECT COUNT(*) FROM dc_monitors WHERE client_id=c.id) as monitor_count,
-                (SELECT COUNT(*) FROM dc_proxies  WHERE client_id=c.id) as proxy_count
+                (SELECT COUNT(*) FROM dc_proxies  WHERE client_id=c.id) as proxy_count,
+                (SELECT code FROM dc_invite_redemptions WHERE client_id=c.id LIMIT 1) as invite_code
             FROM dc_clients c
+            LEFT JOIN dc_subscriptions s ON s.client_id=c.id
             ORDER BY c.created_at DESC
+            """
+        ).fetchall()
+        invite_codes = list_invite_codes()
+        audit_log = conn.execute(
+            "SELECT * FROM dc_audit_log ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+        tier_counts = conn.execute(
+            """
+            SELECT COALESCE(s.tier,'tester') as tier, COUNT(*) as cnt
+            FROM dc_clients c
+            LEFT JOIN dc_subscriptions s ON s.client_id=c.id
+            WHERE c.active=1
+            GROUP BY tier
             """
         ).fetchall()
     return {
@@ -245,6 +601,9 @@ def get_admin_stats() -> Dict[str, Any]:
         "total_monitors": total_monitors,
         "top_urls": [dict(r) for r in top_urls],
         "all_clients": [dict(r) for r in all_clients],
+        "invite_codes": invite_codes,
+        "audit_log": [dict(r) for r in audit_log],
+        "tier_counts": {r["tier"]: r["cnt"] for r in tier_counts},
     }
 
 
@@ -254,3 +613,39 @@ def toggle_client(client_id: int, active: int) -> None:
             "UPDATE dc_clients SET active=? WHERE id=?", (active, client_id)
         )
         conn.commit()
+
+
+def get_client_detail(client_id: int) -> Optional[Dict[str, Any]]:
+    with connect() as conn:
+        client = conn.execute(
+            "SELECT * FROM dc_clients WHERE id=?", (client_id,)
+        ).fetchone()
+        if not client:
+            return None
+        sub = conn.execute(
+            "SELECT * FROM dc_subscriptions WHERE client_id=? ORDER BY id DESC LIMIT 1",
+            (client_id,),
+        ).fetchone()
+        monitors = conn.execute(
+            "SELECT * FROM dc_monitors WHERE client_id=? ORDER BY created_at DESC",
+            (client_id,),
+        ).fetchall()
+        proxies = conn.execute(
+            "SELECT * FROM dc_proxies WHERE client_id=?", (client_id,)
+        ).fetchall()
+        audit = conn.execute(
+            "SELECT * FROM dc_audit_log WHERE target=? ORDER BY created_at DESC LIMIT 20",
+            (str(client_id),),
+        ).fetchall()
+        redemption = conn.execute(
+            "SELECT code FROM dc_invite_redemptions WHERE client_id=? LIMIT 1",
+            (client_id,),
+        ).fetchone()
+    return {
+        "client": dict(client),
+        "subscription": dict(sub) if sub else None,
+        "monitors": [dict(m) for m in monitors],
+        "proxies": [dict(p) for p in proxies],
+        "audit": [dict(a) for a in audit],
+        "invite_code": redemption["code"] if redemption else None,
+    }

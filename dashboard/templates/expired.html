@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Subscription Expired — Viking AI</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="login-body">
+  <div class="login-card" style="max-width:480px;">
+    <div class="login-logo">
+      <span class="logo-mark" style="filter:drop-shadow(0 0 16px rgba(237,66,69,0.5));">⚡</span>
+      <h1>Access Locked</h1>
+      <p class="tagline" style="color:var(--red);">Subscription Expired</p>
+    </div>
+
+    <div class="flash flash-error" style="margin-bottom:20px;">
+      ⚠ Your subscription has expired or your last payment failed.
+      Your monitors have been paused.
+    </div>
+
+    {% if sub %}
+    <div style="background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px 16px;margin-bottom:20px;font-size:.85rem;color:var(--text-muted);">
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+        <span>Plan</span><span style="color:var(--text);">{{ sub.tier|title }}</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;">
+        <span>Status</span>
+        <span style="color:var(--red);">{{ sub.status|title }}</span>
+      </div>
+    </div>
+    {% endif %}
+
+    <p style="font-size:.88rem;color:var(--text-muted);margin-bottom:24px;line-height:1.6;">
+      To restore access, contact the admin or redeem a new invite code.
+      If you have a renewal code, enter it below.
+    </p>
+
+    <form action="/api/invite/redeem" method="POST" style="margin-bottom:16px;">
+      <div class="form-group" style="margin-bottom:10px;">
+        <label for="code">Invite / Renewal Code</label>
+        <input type="text" id="code" name="code" class="input-mono"
+               placeholder="XXXXXXXXXXXX" style="text-transform:uppercase;" required>
+      </div>
+      <button type="submit" class="btn btn-primary" style="width:100%;justify-content:center;">
+        Redeem Code
+      </button>
+    </form>
+
+    <a href="/logout" style="display:block;text-align:center;font-size:.82rem;color:var(--text-muted);">
+      Sign out
+    </a>
+  </div>
+</body>
+</html>

@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Client Detail — Viking AI Admin</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="app-layout">
+
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <span class="logo-icon">⚡</span><span>Viking AI</span>
+    </div>
+    <nav class="sidebar-nav">
+      <div class="nav-label">Admin</div>
+      <a href="/admin" class="nav-link"><span class="nav-icon">📊</span> Overview</a>
+      <a href="/admin" class="nav-link active"><span class="nav-icon">👤</span> Client Detail</a>
+    </nav>
+    <div class="sidebar-user">
+      {% if user.avatar_url %}<img src="{{ user.avatar_url }}" alt="avatar" class="user-avatar">
+      {% else %}<div class="user-avatar-placeholder">{{ user.display_name[0]|upper }}</div>{% endif %}
+      <div class="user-info">
+        <div class="user-name">{{ user.display_name }}</div>
+        <div class="user-email" style="color:var(--accent);font-weight:600;">Admin</div>
+      </div>
+      <a href="/logout" class="logout-btn">↩</a>
+    </div>
+  </aside>
+
+  <main class="main-content" style="max-width:900px;">
+
+    <div class="page-header" style="display:flex;align-items:center;gap:16px;">
+      <a href="/admin" class="btn btn-ghost btn-sm">← Back</a>
+      <div>
+        <h1 class="page-title">{{ detail.client.display_name or 'Client' }}</h1>
+        <p class="page-subtitle">{{ detail.client.email or 'No email' }}</p>
+      </div>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}<div class="flash-container">{% for cat, msg in messages %}
+        <div class="flash flash-{{ 'error' if cat=='error' else 'success' if cat=='success' else 'info' }}">
+          {{ '✓' if cat=='success' else '⚠' if cat=='error' else 'ℹ' }} {{ msg }}
+        </div>{% endfor %}</div>{% endif %}
+    {% endwith %}
+
+    <!-- Summary row -->
+    <div class="stats-grid" style="margin-bottom:20px;">
+      <div class="stat-card">
+        <div class="stat-label">Tier</div>
+        <div class="stat-value" style="font-size:1.4rem;">{{ (detail.subscription.tier if detail.subscription else 'tester')|title }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Status</div>
+        <div class="stat-value" style="font-size:1.4rem;">{{ detail.subscription.status|title if detail.subscription else 'None' }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Monitors</div>
+        <div class="stat-value">{{ detail.monitors|length }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Proxies</div>
+        <div class="stat-value">{{ detail.proxies|length }}</div>
+      </div>
+    </div>
+
+    <!-- Admin Actions -->
+    <div class="card">
+      <div class="card-header"><span class="card-title"><span class="icon">⚙️</span> Admin Actions</span></div>
+      <div class="card-body">
+        <div style="display:flex;gap:16px;flex-wrap:wrap;">
+
+          <!-- Change tier -->
+          <form action="/admin/client/{{ detail.client.id }}/set-tier" method="POST" style="display:flex;gap:8px;align-items:flex-end;">
+            <div class="form-group" style="min-width:140px;">
+              <label>Change Tier</label>
+              <select name="tier" style="background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);padding:9px 12px;font-size:.875rem;">
+                {% for t in tiers %}
+                <option value="{{ t }}" {{ 'selected' if (detail.subscription and detail.subscription.tier==t) }}>{{ t|title }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <button type="submit" class="btn btn-primary">Set Tier</button>
+          </form>
+
+          <!-- Add days -->
+          <form action="/admin/client/{{ detail.client.id }}/add-days" method="POST" style="display:flex;gap:8px;align-items:flex-end;">
+            <div class="form-group" style="min-width:90px;">
+              <label>Add Days</label>
+              <input type="number" name="days" value="7" min="1" max="365">
+            </div>
+            <button type="submit" class="btn btn-ghost">+ Add Days</button>
+          </form>
+
+          <!-- Pause / Resume monitors -->
+          <form action="/admin/client/{{ detail.client.id }}/pause-monitors" method="POST" style="display:flex;gap:8px;align-items:flex-end;">
+            <div class="form-group" style="align-self:flex-end;">
+              <input type="hidden" name="paused" value="1">
+              <button type="submit" class="btn btn-danger">Pause Monitors</button>
+            </div>
+          </form>
+          <form action="/admin/client/{{ detail.client.id }}/pause-monitors" method="POST" style="display:flex;gap:8px;align-items:flex-end;">
+            <div class="form-group" style="align-self:flex-end;">
+              <input type="hidden" name="paused" value="0">
+              <button type="submit" class="btn btn-ghost">Resume Monitors</button>
+            </div>
+          </form>
+
+          <!-- Enable / Disable account -->
+          {% if detail.client.active %}
+          <form action="/admin/client/{{ detail.client.id }}/toggle" method="POST" style="align-self:flex-end;">
+            <input type="hidden" name="active" value="0">
+            <button type="submit" class="btn btn-danger" onclick="return confirm('Disable this account?')">Disable Account</button>
+          </form>
+          {% else %}
+          <form action="/admin/client/{{ detail.client.id }}/toggle" method="POST" style="align-self:flex-end;">
+            <input type="hidden" name="active" value="1">
+            <button type="submit" class="btn btn-ghost">Enable Account</button>
+          </form>
+          {% endif %}
+        </div>
+
+        {% if detail.invite_code %}
+        <p style="margin-top:14px;font-size:.82rem;color:var(--text-muted);">
+          Joined via invite code: <code style="font-family:var(--mono);color:var(--accent);">{{ detail.invite_code }}</code>
+        </p>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Monitors -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">🎯</span> Monitored URLs</span>
+        <span class="card-badge">{{ detail.monitors|length }}</span>
+      </div>
+      <div class="card-body no-pad">
+        {% if detail.monitors %}
+        <table class="data-table">
+          <thead><tr><th>Label</th><th>URL</th><th>Status</th><th>Alerts</th><th>Active</th></tr></thead>
+          <tbody>
+          {% for m in detail.monitors %}
+          <tr>
+            <td>{{ m.label or '—' }}</td>
+            <td><a href="{{ m.url }}" target="_blank" class="cell-url">{{ m.url }}</a></td>
+            <td><span class="badge badge-{{ 'green' if m.last_status=='onsale' else 'red' if m.last_status=='offsale' else 'grey' }}">{{ m.last_status|title }}</span></td>
+            <td>{{ m.alert_count }}</td>
+            <td>{% if m.active %}<span class="badge badge-green">Yes</span>{% else %}<span class="badge badge-grey">Paused</span>{% endif %}</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state"><div class="empty-icon">🎯</div>No monitors.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Audit log for this client -->
+    <div class="card">
+      <div class="card-header"><span class="card-title"><span class="icon">📋</span> Admin Actions on This Client</span></div>
+      <div class="card-body no-pad">
+        {% if detail.audit %}
+        <table class="data-table">
+          <thead><tr><th>Time</th><th>Admin</th><th>Action</th><th>Detail</th></tr></thead>
+          <tbody>
+          {% for a in detail.audit %}
+          <tr>
+            <td style="color:var(--text-muted);font-size:.78rem;white-space:nowrap;">{{ a.created_at|ts_full }}</td>
+            <td style="font-size:.82rem;">{{ a.admin_name or '—' }}</td>
+            <td class="cell-mono" style="font-size:.78rem;color:var(--accent);">{{ a.action }}</td>
+            <td style="font-size:.8rem;color:var(--text-muted);">{{ a.detail or '—' }}</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state"><div class="empty-icon">📋</div>No admin actions yet.</div>
+        {% endif %}
+      </div>
+    </div>
+
+  </main>
+</div>
+</body>
+</html>

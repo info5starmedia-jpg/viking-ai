@@ -1408,6 +1408,58 @@ async def tier_check_cmd(interaction: discord.Interaction) -> None:
 
 
 # ---------------------------------------------------------------------
+# Subscription expiry DM warnings
+# ---------------------------------------------------------------------
+
+async def _expiry_warning_loop() -> None:
+    """
+    Runs every 12 hours.
+    Sends a Discord DM to users whose subscription expires in exactly 7 or 3 days.
+    Requires dashboard db to be reachable and client discord_id to be set.
+    """
+    await client.wait_until_ready()
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dashboard"))
+        import db as _dashboard_db
+    except Exception as _e:
+        logger.warning("expiry_warning_loop: cannot import dashboard db: %s", _e)
+        return
+
+    CHECK_INTERVAL = 12 * 3600  # 12 hours
+
+    while not client.is_closed():
+        try:
+            for days_left in (7, 3):
+                clients = _dashboard_db.get_clients_expiring_in(days_left)
+                for c in clients:
+                    discord_id = c.get("discord_id")
+                    if not discord_id:
+                        continue
+                    try:
+                        user_obj = await client.fetch_user(int(discord_id))
+                        dm = await user_obj.create_dm()
+                        tier = (c.get("tier") or "tester").title()
+                        await dm.send(
+                            f"⚠️ **Viking AI — Subscription Expiry Warning**\n\n"
+                            f"Your **{tier}** plan expires in **{days_left} day{'s' if days_left != 1 else ''}**.\n\n"
+                            f"To renew, contact the admin or redeem a code at your dashboard.\n"
+                            f"Access will be locked immediately on expiry — no grace period."
+                        )
+                        logger.info(
+                            "expiry_warning_loop: sent %dd warning to discord_id=%s", days_left, discord_id
+                        )
+                    except Exception as dm_err:
+                        logger.debug(
+                            "expiry_warning_loop: DM failed for discord_id=%s: %s", discord_id, dm_err
+                        )
+        except Exception as loop_err:
+            logger.warning("expiry_warning_loop: error: %s", loop_err)
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+# ---------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------
 @client.event
@@ -1435,6 +1487,10 @@ async def on_ready() -> None:
 
     t_price = asyncio.create_task(_price_monitor_loop(), name="price_monitor_loop")
     _task_guard("price_monitor_loop", t_price)
+
+    # Subscription expiry DM warnings (7d + 3d)
+    t_expiry = asyncio.create_task(_expiry_warning_loop(), name="expiry_warning_loop")
+    _task_guard("expiry_warning_loop", t_expiry)
 
 def main() -> None:
     client.run(DISCORD_TOKEN)
