@@ -406,16 +406,22 @@ def redeem_invite_code(code: str, client_id: int) -> tuple[bool, str]:
     """
     now = time.time()
     with connect() as conn:
+        # IMMEDIATE lock prevents double-redemption race condition
+        conn.execute("BEGIN IMMEDIATE")
         ic = conn.execute(
             "SELECT * FROM dc_invite_codes WHERE code=?", (code,)
         ).fetchone()
         if not ic:
+            conn.execute("ROLLBACK")
             return False, "Invalid invite code."
         if not ic["active"]:
+            conn.execute("ROLLBACK")
             return False, "This invite code has been deactivated."
         if ic["expires_at"] and now > ic["expires_at"]:
+            conn.execute("ROLLBACK")
             return False, "This invite code has expired."
         if ic["uses_count"] >= ic["max_uses"]:
+            conn.execute("ROLLBACK")
             return False, "This invite code has no uses remaining."
         # Check not already redeemed by this client
         already = conn.execute(
@@ -423,6 +429,7 @@ def redeem_invite_code(code: str, client_id: int) -> tuple[bool, str]:
             (code, client_id),
         ).fetchone()
         if already:
+            conn.execute("ROLLBACK")
             return False, "You have already redeemed this invite code."
 
         # Redeem
@@ -467,10 +474,14 @@ def deactivate_invite_code(code: str, admin_name: str = "admin") -> None:
 def extend_invite_code(code: str, extra_days: int, admin_name: str = "admin") -> None:
     now = time.time()
     with connect() as conn:
-        conn.execute(
-            "UPDATE dc_invite_codes SET expires_at = COALESCE(expires_at, ?) + ? WHERE code=?",
-            (now, extra_days * 86400, code),
-        )
+        # If the code had no expiry, start expiry from now; otherwise extend from existing expiry
+        ic = conn.execute("SELECT expires_at FROM dc_invite_codes WHERE code=?", (code,)).fetchone()
+        if ic:
+            base = ic["expires_at"] if ic["expires_at"] else now
+            conn.execute(
+                "UPDATE dc_invite_codes SET expires_at = ? WHERE code=?",
+                (base + extra_days * 86400, code),
+            )
         conn.execute(
             "INSERT INTO dc_audit_log (admin_name, action, target, detail, created_at) VALUES (?,?,?,?,?)",
             (admin_name, "extend_code", code, f"days={extra_days}", now),
@@ -751,9 +762,14 @@ def remove_personal_watchlist(entry_id: int, client_id: int) -> None:
 
 def get_global_watchlist(active_only: bool = True) -> List[Dict[str, Any]]:
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM dc_watchlist_global" + (" WHERE active=1" if active_only else "") + " ORDER BY created_at DESC"
-        ).fetchall()
+        if active_only:
+            rows = conn.execute(
+                "SELECT * FROM dc_watchlist_global WHERE active=1 ORDER BY created_at DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM dc_watchlist_global ORDER BY created_at DESC"
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -783,9 +799,14 @@ def admin_remove_global_watchlist(wl_id: int, admin_name: str = "admin") -> None
 
 def get_hot_picks(active_only: bool = True) -> List[Dict[str, Any]]:
     with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM dc_hot_picks" + (" WHERE active=1" if active_only else "") + " ORDER BY created_at DESC"
-        ).fetchall()
+        if active_only:
+            rows = conn.execute(
+                "SELECT * FROM dc_hot_picks WHERE active=1 ORDER BY created_at DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM dc_hot_picks ORDER BY created_at DESC"
+            ).fetchall()
     return [dict(r) for r in rows]
 
 

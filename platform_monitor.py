@@ -53,12 +53,51 @@ SH_API_BASE       = "https://api.stubhub.com"
 # Optional deps
 # ---------------------------------------------------------------------------
 
+# Prefer curl_cffi (mimics real browser TLS fingerprint / JA3, bypasses TLS fingerprinting)
+# Fall back to requests if unavailable.
+try:
+    from curl_cffi import requests as _curl_requests  # type: ignore
+    _CURL_OK = True
+except Exception:
+    _curl_requests = None  # type: ignore
+    _CURL_OK = False
+
 try:
     import requests as _requests  # type: ignore
     _REQUESTS_OK = True
 except Exception:
     _requests = None  # type: ignore
     _REQUESTS_OK = False
+
+_HTTP_OK = _CURL_OK or _REQUESTS_OK
+
+# Rotate through common browser User-Agent strings to reduce fingerprinting
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+]
+
+def _browser_headers(idx: int = 0) -> dict:
+    """Return a realistic browser header set for stealth scraping."""
+    ua = _USER_AGENTS[idx % len(_USER_AGENTS)]
+    is_firefox = "Firefox" in ua
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        **({"sec-ch-ua": '"Chromium";v="124","Google Chrome";v="124"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"'} if not is_firefox else {}),
+    }
 
 try:
     from dashboard.db import (  # type: ignore
@@ -102,22 +141,45 @@ def detect_platform(url: str) -> str:
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
-def _get(url: str, params: Optional[Dict] = None, headers: Optional[Dict] = None,
-         proxies: Optional[List[str]] = None, timeout: int = 15) -> Optional[Dict]:
-    """GET with optional proxy rotation. Returns parsed JSON or None."""
-    if not _REQUESTS_OK or _requests is None:
+def _build_proxy_dict(proxies: Optional[List[str]]) -> Optional[Dict]:
+    """Pick one proxy from the list by time-rotation and return a proxy dict."""
+    if not proxies:
         return None
-    proxy_dict = None
-    if proxies:
-        raw = proxies[int(time.time()) % len(proxies)]
-        parts = raw.split(":")
-        if len(parts) >= 4:
-            proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
-        else:
-            proxy_url = f"http://{raw}" if not raw.startswith("http") else raw
-        proxy_dict = {"http": proxy_url, "https": proxy_url}
+    raw = proxies[int(time.time()) % len(proxies)]
+    parts = raw.split(":")
+    if len(parts) >= 4:
+        proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+    else:
+        proxy_url = f"http://{raw}" if not raw.startswith("http") else raw
+    return {"http": proxy_url, "https": proxy_url}
+
+
+def _get(url: str, params: Optional[Dict] = None, headers: Optional[Dict] = None,
+         proxies: Optional[List[str]] = None, timeout: int = 15,
+         ua_idx: int = 0) -> Optional[Dict]:
+    """GET with optional proxy rotation. Returns parsed JSON or None.
+
+    Uses curl_cffi (Chrome TLS/JA3 impersonation) when available, falls back
+    to requests. Browser-realistic headers are injected automatically; callers
+    may override with explicit headers= (e.g. for API auth headers).
+    """
+    if not _HTTP_OK:
+        return None
+    proxy_dict = _build_proxy_dict(proxies)
+    req_headers = {**_browser_headers(ua_idx), **(headers or {})}
     try:
-        r = _requests.get(url, params=params, headers=headers or {}, proxies=proxy_dict, timeout=timeout)
+        if _CURL_OK and _curl_requests is not None:
+            r = _curl_requests.get(
+                url,
+                params=params,
+                headers=req_headers,
+                proxies=proxy_dict,
+                timeout=timeout,
+                impersonate="chrome124",
+            )
+        else:
+            r = _requests.get(url, params=params, headers=req_headers,
+                              proxies=proxy_dict, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -125,30 +187,24 @@ def _get(url: str, params: Optional[Dict] = None, headers: Optional[Dict] = None
         return None
 
 
-def _get_html(url: str, proxies: Optional[List[str]] = None, timeout: int = 15) -> Optional[str]:
-    """GET HTML page with basic browser-like headers."""
-    if not _REQUESTS_OK or _requests is None:
+def _get_html(url: str, proxies: Optional[List[str]] = None, timeout: int = 15,
+              ua_idx: int = 0) -> Optional[str]:
+    """GET HTML page with full browser-like headers and TLS impersonation."""
+    if not _HTTP_OK:
         return None
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    proxy_dict = None
-    if proxies:
-        raw = proxies[int(time.time()) % len(proxies)]
-        parts = raw.split(":")
-        if len(parts) >= 4:
-            proxy_url = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
-        else:
-            proxy_url = f"http://{raw}" if not raw.startswith("http") else raw
-        proxy_dict = {"http": proxy_url, "https": proxy_url}
+    proxy_dict = _build_proxy_dict(proxies)
+    req_headers = _browser_headers(ua_idx)
     try:
-        r = _requests.get(url, headers=headers, proxies=proxy_dict, timeout=timeout)
+        if _CURL_OK and _curl_requests is not None:
+            r = _curl_requests.get(
+                url,
+                headers=req_headers,
+                proxies=proxy_dict,
+                timeout=timeout,
+                impersonate="chrome124",
+            )
+        else:
+            r = _requests.get(url, headers=req_headers, proxies=proxy_dict, timeout=timeout)
         r.raise_for_status()
         return r.text
     except Exception as e:
@@ -233,9 +289,12 @@ def poll_seatgeek_price(monitor: Dict[str, Any]) -> Optional[Tuple[Optional[floa
     if SG_CLIENT_ID:
         event_id = _sg_event_id_from_url(url)
         if event_id:
+            sg_params: Dict = {"client_id": SG_CLIENT_ID}
+            if SG_CLIENT_SECRET:
+                sg_params["client_secret"] = SG_CLIENT_SECRET
             data = _get(
                 f"{SG_API_BASE}/events/{event_id}",
-                params={"client_id": SG_CLIENT_ID, "client_secret": SG_CLIENT_SECRET or None},
+                params=sg_params,
                 proxies=proxies,
             )
             if data:
@@ -249,10 +308,17 @@ def poll_seatgeek_price(monitor: Dict[str, Any]) -> Optional[Tuple[Optional[floa
 
         slug = _sg_performer_slug_from_url(url)
         if slug:
+            sg_params2: Dict = {
+                "client_id": SG_CLIENT_ID,
+                "performers.slug": slug,
+                "per_page": 1,
+                "sort": "lowest_price.asc",
+            }
+            if SG_CLIENT_SECRET:
+                sg_params2["client_secret"] = SG_CLIENT_SECRET
             data = _get(
                 f"{SG_API_BASE}/events",
-                params={"client_id": SG_CLIENT_ID, "performers.slug": slug,
-                        "per_page": 1, "sort": "lowest_price.asc"},
+                params=sg_params2,
                 proxies=proxies,
             )
             if data:
@@ -495,7 +561,7 @@ PLATFORMS = ("seatgeek", "stubhub", "vividseats")
 
 
 def is_available() -> bool:
-    return _REQUESTS_OK and _DB_OK
+    return _HTTP_OK and _DB_OK
 
 
 async def platform_watch_loop(

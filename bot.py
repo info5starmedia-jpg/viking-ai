@@ -172,6 +172,7 @@ STATUS: Dict[str, Any] = {
         "tour_scan_monitor": bool(tour_scan_monitor),
         "tm_surge_watch": bool(tm_surge_watch and getattr(tm_surge_watch, "is_available", lambda: False)()),
         "drop_catcher": bool(drop_catcher and getattr(drop_catcher, "is_available", lambda: False)()),
+        "platform_monitor": bool(platform_monitor and getattr(platform_monitor, "is_available", lambda: False)()),
     },
     "last_posts": {
         "price_unix": None,
@@ -179,6 +180,7 @@ STATUS: Dict[str, Any] = {
         "tour_unix": None,
         "tm_surge_unix": None,
         "drop_catcher_unix": None,
+        "platform_monitor_unix": None,
     },
     "tasks": {},
 }
@@ -971,7 +973,7 @@ async def _start_platform_monitor() -> None:
                 await post_message(payload.get("text", str(payload)), prefer="drop")
         else:
             await post_message(str(payload), prefer="drop")
-        STATUS["last_posts"]["drop_catcher_unix"] = time.time()
+        STATUS["last_posts"]["platform_monitor_unix"] = time.time()
 
     stop_event = asyncio.Event()
     task = asyncio.create_task(

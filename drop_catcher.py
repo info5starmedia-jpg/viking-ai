@@ -314,14 +314,16 @@ async def _enrich_with_seatmap(event_id: str) -> Optional[str]:
     Try to fetch live seatmap and return a short enrichment string, or None.
     Non-fatal — if anything fails we just skip it.
     """
-    if not _get_live_seatmap or not _summarize_inventory or not _assess_seatmap:
+    if not callable(_get_live_seatmap) or not callable(_summarize_inventory) or not callable(_assess_seatmap):
         return None
     try:
         seatmap_data = await _get_live_seatmap(event_id)
-        if seatmap_data.get("error"):
+        if not isinstance(seatmap_data, dict) or seatmap_data.get("error"):
             return None
         raw_seatmap = seatmap_data.get("seatmap") or {}
         summary = await asyncio.to_thread(_summarize_inventory, raw_seatmap)
+        if not isinstance(summary, dict):
+            return None
         total = summary.get("total_seats", 0)
         available = summary.get("available_seats", 0)
         if total > 0:
@@ -333,7 +335,9 @@ async def _enrich_with_seatmap(event_id: str) -> Optional[str]:
                 for _ in range(int(sec.get("total", 0)) - int(sec.get("available", 0))):
                     seat_list.append({"status": "sold", "price": sec.get("price", 0)})
             if seat_list:
-                intel = _assess_seatmap(seat_list)
+                intel = await asyncio.to_thread(_assess_seatmap, seat_list)
+                if not isinstance(intel, dict):
+                    return None
                 sell_pct = intel.get("sell_through_pct", 0.0)
                 signals = intel.get("signals") or []
                 lines = [f"Seats: {available}/{total} available ({100 - sell_pct:.0f}% open)"]
@@ -741,11 +745,10 @@ def _prune_aggressive_targets() -> None:
 
 def _prewarm_url(url: str) -> None:
     """Non-blocking HTTP HEAD to warm the TCP connection to TM."""
-    if not url:
+    if not url or _requests is None:
         return
     try:
-        import requests as _req
-        _req.head(url, timeout=5, allow_redirects=False)
+        _requests.head(url, timeout=5, allow_redirects=False)
         logger.debug("drop_catcher: pre-warmed %s", url)
     except Exception:
         pass

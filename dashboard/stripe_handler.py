@@ -158,22 +158,21 @@ def _handle_subscription_deleted(sub: dict) -> None:
 def _handle_payment_failed(invoice: dict) -> None:
     """Mark subscription as past_due on failed payment."""
     subscription_id = invoice.get("subscription", "")
-    customer_id = invoice.get("customer", "")
     if not subscription_id:
         return
-
-    # Find client and mark past_due
-    import sqlite3 as _sqlite3
-    with dashboard_db.connect() as conn:
-        row = conn.execute(
-            "SELECT client_id FROM dc_subscriptions WHERE stripe_subscription_id=?",
-            (subscription_id,),
-        ).fetchone()
-        if row:
-            dashboard_db.set_subscription_status(row["client_id"], "past_due")
-            logger.info(
-                "stripe_handler: payment_failed → past_due client_id=%s", row["client_id"]
-            )
+    try:
+        with dashboard_db.connect() as conn:
+            row = conn.execute(
+                "SELECT client_id FROM dc_subscriptions WHERE stripe_subscription_id=?",
+                (subscription_id,),
+            ).fetchone()
+            if row:
+                dashboard_db.set_subscription_status(row["client_id"], "past_due")
+                logger.info(
+                    "stripe_handler: payment_failed → past_due client_id=%s", row["client_id"]
+                )
+    except Exception as exc:
+        logger.error("stripe_handler: payment_failed db error sub=%s: %s", subscription_id, exc)
 
 
 def _handle_payment_succeeded(invoice: dict) -> None:
@@ -181,14 +180,16 @@ def _handle_payment_succeeded(invoice: dict) -> None:
     subscription_id = invoice.get("subscription", "")
     if not subscription_id:
         return
-
-    with dashboard_db.connect() as conn:
-        row = conn.execute(
-            "SELECT client_id FROM dc_subscriptions WHERE stripe_subscription_id=?",
-            (subscription_id,),
-        ).fetchone()
-        if row:
-            dashboard_db.set_subscription_status(row["client_id"], "active")
-            logger.info(
-                "stripe_handler: payment_succeeded → active client_id=%s", row["client_id"]
-            )
+    try:
+        with dashboard_db.connect() as conn:
+            row = conn.execute(
+                "SELECT client_id FROM dc_subscriptions WHERE stripe_subscription_id=?",
+                (subscription_id,),
+            ).fetchone()
+            if row:
+                dashboard_db.set_subscription_status(row["client_id"], "active")
+                logger.info(
+                    "stripe_handler: payment_succeeded → active client_id=%s", row["client_id"]
+                )
+    except Exception as exc:
+        logger.error("stripe_handler: payment_succeeded db error sub=%s: %s", subscription_id, exc)

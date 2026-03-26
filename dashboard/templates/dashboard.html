@@ -32,7 +32,7 @@
         <div class="user-name">{{ user.display_name }}</div>
         <div class="user-email">{{ user.email or 'No email' }}</div>
       </div>
-      <a href="/logout" class="logout-btn" title="Sign out">↩</a>
+      <a href="/logout" class="logout-btn" title="Sign out" aria-label="Sign out">↩</a>
     </div>
   </aside>
 
@@ -67,8 +67,9 @@
 
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}<div class="flash-container">{% for cat, msg in messages %}
-        <div class="flash flash-{{ 'error' if cat=='error' else 'success' if cat=='success' else 'info' }}">
+        <div class="flash flash-{{ 'error' if cat=='error' else 'success' if cat=='success' else 'info' }}" role="alert" aria-live="polite">
           {{ '✓' if cat=='success' else '⚠' if cat=='error' else 'ℹ' }} {{ msg }}
+          <button class="flash-close" onclick="this.parentElement.remove()" aria-label="Dismiss">×</button>
         </div>{% endfor %}</div>{% endif %}
     {% endwith %}
 
@@ -138,8 +139,9 @@
 
       <div class="card-body no-pad">
         {% if monitors %}
+        <div class="table-responsive">
         <table class="data-table">
-          <thead><tr><th>Label</th><th>URL</th><th>Platform</th><th>Status</th><th>Alerts</th><th></th></tr></thead>
+          <thead><tr><th scope="col">Label</th><th scope="col">URL</th><th scope="col">Platform</th><th scope="col">Status</th><th scope="col">Alerts</th><th scope="col"></th></tr></thead>
           <tbody>
           {% for m in monitors %}
           <tr>
@@ -147,10 +149,10 @@
             <td><a href="{{ m.url }}" target="_blank" rel="noopener" class="cell-url" title="{{ m.url }}">{{ m.url }}</a></td>
             <td>
               {% set p = m.platform or 'ticketmaster' %}
-              {% if p == 'seatgeek' %}<span class="badge badge-green" style="font-size:.68rem;">SeatGeek</span>
-              {% elif p == 'stubhub' %}<span class="badge badge-yellow" style="font-size:.68rem;">StubHub</span>
-              {% elif p == 'vividseats' %}<span class="badge" style="background:#7b3f9e;color:#fff;font-size:.68rem;">VividSeats</span>
-              {% else %}<span class="badge badge-grey" style="font-size:.68rem;">TM</span>{% endif %}
+              {% if p == 'seatgeek' %}<span class="badge badge-seatgeek" style="font-size:.68rem;">SeatGeek</span>
+              {% elif p == 'stubhub' %}<span class="badge badge-stubhub" style="font-size:.68rem;">StubHub</span>
+              {% elif p == 'vividseats' %}<span class="badge badge-vividseats" style="font-size:.68rem;">VividSeats</span>
+              {% else %}<span class="badge badge-tm" style="font-size:.68rem;">TM</span>{% endif %}
             </td>
             <td>
               {% if m.last_status == 'onsale' %}<span class="badge badge-green"><span class="badge-dot"></span>On Sale</span>
@@ -167,10 +169,11 @@
           {% endfor %}
           </tbody>
         </table>
+        </div>
         {% else %}
         <div class="empty-state">
           <div class="empty-icon">🎯</div>
-          No monitors yet. Paste a Ticketmaster URL above to start watching.
+          No monitors yet. Paste a URL above to start watching.
         </div>
         {% endif %}
       </div>

@@ -43,8 +43,9 @@
 
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}<div class="flash-container">{% for cat, msg in messages %}
-        <div class="flash flash-{{ 'error' if cat=='error' else 'success' if cat=='success' else 'info' }}">
+        <div class="flash flash-{{ 'error' if cat=='error' else 'success' if cat=='success' else 'info' }}" role="alert" aria-live="polite">
           {{ '✓' if cat=='success' else '⚠' if cat=='error' else 'ℹ' }} {{ msg }}
+          <button class="flash-close" onclick="this.parentElement.remove()" aria-label="Dismiss">×</button>
         </div>{% endfor %}</div>{% endif %}
     {% endwith %}
 

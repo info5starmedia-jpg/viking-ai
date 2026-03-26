@@ -382,6 +382,7 @@ def _fmt_date(date_str: str) -> str:
         return ""
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
-        return dt.strftime("%b %-d, %Y")
+        # %d gives zero-padded day; lstrip removes leading zero (cross-platform)
+        return dt.strftime("%b %d, %Y").replace(" 0", " ")
     except Exception:
         return date_str

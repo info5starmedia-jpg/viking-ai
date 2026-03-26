@@ -42,6 +42,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import re
+
 from flask import (
     Flask, flash, redirect, render_template,
     request, session, url_for,
@@ -60,8 +62,17 @@ import stripe_handler as _stripe_handler
 # App
 # ---------------------------------------------------------------------------
 
+_SECRET_KEY = os.getenv("DASHBOARD_SECRET_KEY", "")
+if not _SECRET_KEY:
+    import warnings
+    warnings.warn(
+        "DASHBOARD_SECRET_KEY not set — using insecure default. Set this env var before deploying.",
+        stacklevel=1,
+    )
+    _SECRET_KEY = "dev-secret-insecure-change-before-deploy"
+
 app = Flask(__name__)
-app.secret_key = os.getenv("DASHBOARD_SECRET_KEY", "dev-secret-change-me")
+app.secret_key = _SECRET_KEY
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
@@ -214,6 +225,8 @@ def auth_discord_callback():
     try:
         token = oauth.discord.authorize_access_token()
         u = oauth.discord.get("users/@me", token=token).json()
+        if not u.get("id"):
+            raise ValueError("Discord OAuth returned no user ID")
 
         discord_id  = str(u.get("id", ""))
         email       = u.get("email", "")
@@ -254,6 +267,8 @@ def auth_google_callback():
     try:
         token = oauth.google.authorize_access_token()
         u = token.get("userinfo") or {}
+        if not u.get("sub"):
+            raise ValueError("Google OAuth returned no user ID")
 
         google_id    = str(u.get("sub", ""))
         email        = u.get("email", "")
@@ -448,8 +463,9 @@ def api_monitor_delete(monitor_id):
 def api_webhook_save():
     user    = current_user()
     webhook = (request.form.get("discord_webhook") or "").strip()
-    if webhook and not webhook.startswith("https://discord.com/api/webhooks/"):
-        flash("Invalid Discord webhook URL.", "error")
+    _webhook_pattern = r"^https://discord\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+$"
+    if webhook and not re.match(_webhook_pattern, webhook):
+        flash("Invalid Discord webhook URL. Expected: https://discord.com/api/webhooks/ID/TOKEN", "error")
         return redirect(url_for("dashboard") + "#webhook")
     dashboard_db.set_global_webhook(user["id"], webhook)
     flash("Discord webhook saved and applied to all monitors.", "success")
