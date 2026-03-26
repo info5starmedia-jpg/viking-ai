@@ -678,7 +678,7 @@ def _extract_prices(event: Dict[str, Any]) -> Tuple[Optional[float], Optional[fl
 # ---------------------------------------------------------------------------
 
 async def drop_watch_loop(
-    discord_post: Callable[[str], Awaitable[None]],
+    discord_post: Callable[[Any], Awaitable[None]],
     stop_event: Optional[asyncio.Event] = None,
 ) -> None:
     """
@@ -746,7 +746,7 @@ def _parse_sell_through(seatmap_txt: Optional[str]) -> float:
     return 0.0
 
 
-async def _poll_watched_events(discord_post: Callable[[str], Awaitable[None]]) -> None:
+async def _poll_watched_events(discord_post: Callable[[Any], Awaitable[None]]) -> None:
     """Track 1: check each individually-registered event ID."""
     now = time.time()
 
@@ -806,29 +806,61 @@ async def _poll_watched_events(discord_post: Callable[[str], Awaitable[None]]) -
                 "price_min": new_price_min,
                 "price_max": new_price_max,
             }
-            alert = _format_drop_alert(enriched_row, new_status, seatmap_txt, sell_through)
+            # Build structured alert dict — bot uses this for rich embeds.
+            # "text" fallback is used by plain-text consumers.
+            alert_data = {
+                "type": "sale_start",
+                "event_id": event_id,
+                "name": new_name,
+                "artist": norm.get("artist") or row.get("artist") or "",
+                "url": new_url,
+                "city": norm.get("city") or "",
+                "country": norm.get("country") or "",
+                "event_local_date": norm.get("event_local_date") or "",
+                "price_min": new_price_min,
+                "price_max": new_price_max,
+                "old_status": old_status,
+                "new_status": new_status,
+                "seatmap_txt": seatmap_txt,
+                "sell_through_pct": sell_through,
+                "source": "Ticketmaster",
+                "text": _format_drop_alert(enriched_row, new_status, seatmap_txt, sell_through),
+            }
             logger.info(
                 "drop_catcher: DROP event_id=%s (%s → %s)", event_id, old_status, new_status
             )
             try:
-                await discord_post(alert)
+                await discord_post(alert_data)
             except Exception as e:
                 logger.warning("drop_catcher: discord_post failed: %s", e)
 
         await asyncio.sleep(1)  # rate-limit TM requests
 
 
-async def _poll_global_scan(discord_post: Callable[[str], Awaitable[None]]) -> None:
+async def _poll_global_scan(discord_post: Callable[[Any], Awaitable[None]]) -> None:
     """Track 2: fire alerts for any music event that just went on-sale globally."""
     result = await asyncio.to_thread(scan_new_onsales, GLOBAL_SCAN_HOURS)
     new_items = result.get("new") or []
     updated_items = result.get("updated") or []
 
     for norm in new_items:
-        alert = _format_global_drop_alert(norm, "NEW")
+        alert_data = {
+            "type": "new_event",
+            "event_id": norm.get("id") or "",
+            "name": norm.get("name") or "Unknown Event",
+            "artist": norm.get("artist") or "",
+            "url": norm.get("url") or "",
+            "city": norm.get("city") or "",
+            "country": norm.get("country") or "",
+            "event_local_date": norm.get("event_local_date") or "",
+            "price_min": norm.get("price_min"),
+            "price_max": norm.get("price_max"),
+            "source": "Ticketmaster",
+            "text": _format_global_drop_alert(norm, "NEW"),
+        }
         logger.info("drop_catcher: global NEW onsale — %s (%s)", norm.get("id"), norm.get("name"))
         try:
-            await discord_post(alert)
+            await discord_post(alert_data)
         except Exception as e:
             logger.warning("drop_catcher: discord_post (global new) failed: %s", e)
         await asyncio.sleep(0.5)
@@ -836,13 +868,28 @@ async def _poll_global_scan(discord_post: Callable[[str], Awaitable[None]]) -> N
     for norm in updated_items:
         # Only alert on status-change updates (not just price drift)
         if norm.get("prev_status") != norm.get("status"):
-            alert = _format_global_drop_alert(norm, "UPDATED")
+            alert_data = {
+                "type": "restock",
+                "event_id": norm.get("id") or "",
+                "name": norm.get("name") or "Unknown Event",
+                "artist": norm.get("artist") or "",
+                "url": norm.get("url") or "",
+                "city": norm.get("city") or "",
+                "country": norm.get("country") or "",
+                "event_local_date": norm.get("event_local_date") or "",
+                "price_min": norm.get("price_min"),
+                "price_max": norm.get("price_max"),
+                "old_status": norm.get("prev_status") or "",
+                "new_status": norm.get("status") or "",
+                "source": "Ticketmaster",
+                "text": _format_global_drop_alert(norm, "UPDATED"),
+            }
             logger.info(
                 "drop_catcher: global UPDATED — %s (%s → %s)",
                 norm.get("id"), norm.get("prev_status"), norm.get("status"),
             )
             try:
-                await discord_post(alert)
+                await discord_post(alert_data)
             except Exception as e:
                 logger.warning("drop_catcher: discord_post (global update) failed: %s", e)
             await asyncio.sleep(0.5)

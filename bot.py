@@ -23,6 +23,13 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+try:
+    from embed_builder import build_alert, AlertView
+    _EMBED_BUILDER_OK = True
+except Exception as _eb_err:
+    _EMBED_BUILDER_OK = False
+    logging.getLogger(__name__).warning("embed_builder not available: %s", _eb_err)
+
 # ---------------------------------------------------------------------
 # .env (single source of truth)
 # ---------------------------------------------------------------------
@@ -120,6 +127,29 @@ city_boosts = _try_import("city_boosts")
 INTENTS = discord.Intents.default()
 client = discord.Client(intents=INTENTS)
 tree = app_commands.CommandTree(client)
+
+
+# Dismiss button interaction — handled globally via on_interaction
+@client.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    if interaction.type != discord.InteractionType.component:
+        return
+    data = interaction.data or {}
+    if data.get("custom_id") == "viking_alert_dismiss":
+        try:
+            await interaction.response.edit_message(
+                content="*(alert dismissed)*",
+                embed=None,
+                view=None,
+            )
+        except discord.NotFound:
+            pass
+        except Exception as exc:
+            logger.debug("dismiss interaction error: %s", exc)
+            try:
+                await interaction.response.send_message("Dismissed.", ephemeral=True)
+            except Exception:
+                pass
 
 # Background tasks registry
 TASKS: Dict[str, asyncio.Task] = {}
@@ -243,6 +273,80 @@ async def _send_webhook(url: str, content: str) -> None:
         await wh.send(content=content)
     except Exception as e:
         logger.warning("Webhook send failed: %s", e)
+
+
+async def _send_webhook_embed(
+    url: str,
+    embed: "discord.Embed",
+    view: "Optional[discord.ui.View]" = None,
+    content: str = "",
+) -> None:
+    """Send an embed (+ optional link-only view) via a Discord webhook URL."""
+    try:
+        wh = discord.Webhook.from_url(url, client=client)
+        kwargs: Dict[str, Any] = {"embed": embed}
+        if content:
+            kwargs["content"] = content
+        if view:
+            kwargs["view"] = view
+        await wh.send(**kwargs)
+    except Exception as e:
+        logger.warning("Webhook embed send failed: %s", e)
+
+
+async def post_rich(
+    embed: "discord.Embed",
+    view: "Optional[discord.ui.View]" = None,
+    content: str = "",
+    *,
+    prefer: str = "drop",
+) -> None:
+    """
+    Post a rich embed + optional view to the configured drop/alert destination.
+    Falls back to post_message(content) if embed_builder is unavailable.
+    prefer: default | price | vf | tour | drop
+    """
+    _webhook_urls = {
+        "price": PRICE_WEBHOOK_URL,
+        "vf":    VERIFIED_FAN_WEBHOOK_URL,
+        "tour":  TOUR_SCAN_WEBHOOK_URL,
+        "drop":  DROP_CATCHER_WEBHOOK_URL,
+    }
+    wh_url = _webhook_urls.get(prefer, "")
+    if wh_url:
+        # Webhooks: use link-only view (no interaction callback)
+        link_view = None
+        if view:
+            link_view = discord.ui.View()
+            for child in view.children:
+                if isinstance(child, discord.ui.Button) and child.url:
+                    link_view.add_item(
+                        discord.ui.Button(label=child.label, url=child.url,
+                                          style=discord.ButtonStyle.link)
+                    )
+        await _send_webhook_embed(wh_url, embed, link_view or None, content)
+        return
+
+    _channel_ids = {
+        "price": PRICE_ALERT_CHANNEL_ID,
+        "vf":    VERIFIED_FAN_ALERT_CHANNEL_ID,
+        "tour":  TOUR_SCAN_ALERT_CHANNEL_ID,
+        "drop":  DROP_CATCHER_CHANNEL_ID,
+    }
+    target_id = _channel_ids.get(prefer, 0) or DEFAULT_CHANNEL_ID
+    ch = await _get_channel(target_id)
+    if not ch:
+        logger.warning("post_rich: no channel configured (%s)", prefer)
+        return
+    try:
+        send_kwargs: Dict[str, Any] = {"embed": embed}
+        if content:
+            send_kwargs["content"] = content
+        if view:
+            send_kwargs["view"] = view
+        await ch.send(**send_kwargs)
+    except Exception as e:
+        logger.warning("post_rich channel send failed: %s", e)
 
 async def post_message(content: str, *, prefer: str = "default") -> None:
     """
@@ -823,8 +927,18 @@ async def _start_drop_catcher() -> None:
         logger.info("drop_catcher: ticketmaster agent unavailable; skipping.")
         return
 
-    async def _discord_post(msg: str) -> None:
-        await post_message(msg, prefer="drop")
+    async def _discord_post(payload) -> None:
+        if isinstance(payload, dict):
+            try:
+                embed, view = build_alert(payload, link_only=False)
+                role_id = os.getenv("DROP_PING_ROLE_ID", "")
+                content = f"<@&{role_id}>" if role_id else ""
+                await post_rich(embed, view, content=content, prefer="drop")
+            except Exception as e:
+                logger.warning("drop_catcher embed build failed: %s", e)
+                await post_message(payload.get("text", str(payload)), prefer="drop")
+        else:
+            await post_message(str(payload), prefer="drop")
         STATUS["last_posts"]["drop_catcher_unix"] = time.time()
 
     stop_event = asyncio.Event()
