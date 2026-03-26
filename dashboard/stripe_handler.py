@@ -43,13 +43,22 @@ _PRICE_TO_TIER: dict[str, str] = {}
 
 def _load_price_map() -> None:
     global _PRICE_TO_TIER
-    _PRICE_TO_TIER = {
-        p: t for p, t in [
-            (os.getenv("STRIPE_STARTER_PRICE_ID", ""),   "starter"),
-            (os.getenv("STRIPE_PRO_PRICE_ID", ""),        "pro"),
-            (os.getenv("STRIPE_UNLIMITED_PRICE_ID", ""), "unlimited"),
-        ] if p
-    }
+    mapping = [
+        ("STRIPE_STARTER_PRICE_ID",   "starter"),
+        ("STRIPE_PRO_PRICE_ID",        "pro"),
+        ("STRIPE_UNLIMITED_PRICE_ID", "unlimited"),
+    ]
+    _PRICE_TO_TIER = {}
+    for env_var, tier in mapping:
+        val = os.getenv(env_var, "")
+        if val:
+            _PRICE_TO_TIER[val] = tier
+        else:
+            logger.warning(
+                "stripe_handler: %s is not set — webhook events for %s tier will "
+                "default to 'starter'. Set this env var to enable correct tier assignment.",
+                env_var, tier,
+            )
 
 
 def _tier_from_price(price_id: str) -> str:

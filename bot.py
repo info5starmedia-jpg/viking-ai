@@ -932,13 +932,16 @@ async def _start_drop_catcher() -> None:
 
     async def _discord_post(payload) -> None:
         if isinstance(payload, dict):
-            try:
-                embed, view = build_alert(payload, link_only=False)
-                role_id = os.getenv("DROP_PING_ROLE_ID", "")
-                content = f"<@&{role_id}>" if role_id else ""
-                await post_rich(embed, view, content=content, prefer="drop")
-            except Exception as e:
-                logger.warning("drop_catcher embed build failed: %s", e)
+            if _EMBED_BUILDER_OK:
+                try:
+                    embed, view = build_alert(payload, link_only=False)
+                    role_id = os.getenv("DROP_PING_ROLE_ID", "")
+                    content = f"<@&{role_id}>" if role_id else ""
+                    await post_rich(embed, view, content=content, prefer="drop")
+                except Exception as e:
+                    logger.warning("drop_catcher embed build failed: %s", e)
+                    await post_message(payload.get("text", str(payload)), prefer="drop")
+            else:
                 await post_message(payload.get("text", str(payload)), prefer="drop")
         else:
             await post_message(str(payload), prefer="drop")
@@ -963,13 +966,16 @@ async def _start_platform_monitor() -> None:
 
     async def _platform_discord_post(payload) -> None:
         if isinstance(payload, dict):
-            try:
-                embed, view = build_alert(payload, link_only=False)
-                role_id = os.getenv("DROP_PING_ROLE_ID", "")
-                content = f"<@&{role_id}>" if role_id else ""
-                await post_rich(embed, view, content=content, prefer="drop")
-            except Exception as e:
-                logger.warning("platform_monitor embed build failed: %s", e)
+            if _EMBED_BUILDER_OK:
+                try:
+                    embed, view = build_alert(payload, link_only=False)
+                    role_id = os.getenv("DROP_PING_ROLE_ID", "")
+                    content = f"<@&{role_id}>" if role_id else ""
+                    await post_rich(embed, view, content=content, prefer="drop")
+                except Exception as e:
+                    logger.warning("platform_monitor embed build failed: %s", e)
+                    await post_message(payload.get("text", str(payload)), prefer="drop")
+            else:
                 await post_message(payload.get("text", str(payload)), prefer="drop")
         else:
             await post_message(str(payload), prefer="drop")
