@@ -632,8 +632,14 @@ def _tour_full_intel_message(item: Dict[str, Any]) -> str:
 
     lines.append("")
     lines.append("**On-sale dates**")
-    lines.append("• Presale: (add enrichment next)")
-    lines.append("• General sale: (add enrichment next)")
+    presale = (item.get("presale_date") or item.get("presale") or "").strip()
+    sale = (item.get("onsale_date") or item.get("general_sale") or item.get("sale_date") or "").strip()
+    if presale:
+        lines.append(f"• Presale: {presale}")
+    if sale:
+        lines.append(f"• General sale: {sale}")
+    if not presale and not sale:
+        lines.append("• Check artist/venue site for exact on-sale times")
 
     return _safe_truncate("\n".join(lines).strip(), 1900)
 
@@ -889,10 +895,15 @@ async def _intel_v1(artist: str) -> str:
             if url:
                 lines.append(f"  Tickets: {url}")
 
-    lines.append("")
-    lines.append("**Links (best-effort)**")
-    lines.append("• Official site: (add via Tavily/Google agent enrichment next)")
-    lines.append("• Presales: (add via Tavily/Google agent enrichment next)")
+    official = (item.get("official_url") or item.get("artist_url") or "").strip()
+    presale_url = (item.get("presale_url") or "").strip()
+    if official or presale_url:
+        lines.append("")
+        lines.append("**Links**")
+        if official:
+            lines.append(f"• Official site: {official}")
+        if presale_url:
+            lines.append(f"• Presales: {presale_url}")
 
     return _safe_truncate("\n".join(lines), 1900)
 
