@@ -23,6 +23,13 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+try:
+    from embed_builder import build_alert, AlertView
+    _EMBED_BUILDER_OK = True
+except Exception as _eb_err:
+    _EMBED_BUILDER_OK = False
+    logging.getLogger(__name__).warning("embed_builder not available: %s", _eb_err)
+
 # ---------------------------------------------------------------------
 # .env (single source of truth)
 # ---------------------------------------------------------------------
@@ -100,6 +107,7 @@ verified_fan_monitor = _try_import("verified_fan_monitor")
 tour_scan_monitor = _try_import("tour_scan_monitor")
 tm_surge_watch = _try_import("tm_surge_watch")
 drop_catcher = _try_import("drop_catcher")
+platform_monitor = _try_import("platform_monitor")
 usage_db = _try_import("usage_db")
 
 ticketmaster_agent = _try_import("ticketmaster_agent")
@@ -121,6 +129,29 @@ INTENTS = discord.Intents.default()
 client = discord.Client(intents=INTENTS)
 tree = app_commands.CommandTree(client)
 
+
+# Dismiss button interaction — handled globally via on_interaction
+@client.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    if interaction.type != discord.InteractionType.component:
+        return
+    data = interaction.data or {}
+    if data.get("custom_id") == "viking_alert_dismiss":
+        try:
+            await interaction.response.edit_message(
+                content="*(alert dismissed)*",
+                embed=None,
+                view=None,
+            )
+        except discord.NotFound:
+            pass
+        except Exception as exc:
+            logger.debug("dismiss interaction error: %s", exc)
+            try:
+                await interaction.response.send_message("Dismissed.", ephemeral=True)
+            except Exception:
+                pass
+
 # Background tasks registry
 TASKS: Dict[str, asyncio.Task] = {}
 
@@ -141,6 +172,7 @@ STATUS: Dict[str, Any] = {
         "tour_scan_monitor": bool(tour_scan_monitor),
         "tm_surge_watch": bool(tm_surge_watch and getattr(tm_surge_watch, "is_available", lambda: False)()),
         "drop_catcher": bool(drop_catcher and getattr(drop_catcher, "is_available", lambda: False)()),
+        "platform_monitor": bool(platform_monitor and getattr(platform_monitor, "is_available", lambda: False)()),
     },
     "last_posts": {
         "price_unix": None,
@@ -148,6 +180,7 @@ STATUS: Dict[str, Any] = {
         "tour_unix": None,
         "tm_surge_unix": None,
         "drop_catcher_unix": None,
+        "platform_monitor_unix": None,
     },
     "tasks": {},
 }
@@ -243,6 +276,80 @@ async def _send_webhook(url: str, content: str) -> None:
         await wh.send(content=content)
     except Exception as e:
         logger.warning("Webhook send failed: %s", e)
+
+
+async def _send_webhook_embed(
+    url: str,
+    embed: "discord.Embed",
+    view: "Optional[discord.ui.View]" = None,
+    content: str = "",
+) -> None:
+    """Send an embed (+ optional link-only view) via a Discord webhook URL."""
+    try:
+        wh = discord.Webhook.from_url(url, client=client)
+        kwargs: Dict[str, Any] = {"embed": embed}
+        if content:
+            kwargs["content"] = content
+        if view:
+            kwargs["view"] = view
+        await wh.send(**kwargs)
+    except Exception as e:
+        logger.warning("Webhook embed send failed: %s", e)
+
+
+async def post_rich(
+    embed: "discord.Embed",
+    view: "Optional[discord.ui.View]" = None,
+    content: str = "",
+    *,
+    prefer: str = "drop",
+) -> None:
+    """
+    Post a rich embed + optional view to the configured drop/alert destination.
+    Falls back to post_message(content) if embed_builder is unavailable.
+    prefer: default | price | vf | tour | drop
+    """
+    _webhook_urls = {
+        "price": PRICE_WEBHOOK_URL,
+        "vf":    VERIFIED_FAN_WEBHOOK_URL,
+        "tour":  TOUR_SCAN_WEBHOOK_URL,
+        "drop":  DROP_CATCHER_WEBHOOK_URL,
+    }
+    wh_url = _webhook_urls.get(prefer, "")
+    if wh_url:
+        # Webhooks: use link-only view (no interaction callback)
+        link_view = None
+        if view:
+            link_view = discord.ui.View()
+            for child in view.children:
+                if isinstance(child, discord.ui.Button) and child.url:
+                    link_view.add_item(
+                        discord.ui.Button(label=child.label, url=child.url,
+                                          style=discord.ButtonStyle.link)
+                    )
+        await _send_webhook_embed(wh_url, embed, link_view or None, content)
+        return
+
+    _channel_ids = {
+        "price": PRICE_ALERT_CHANNEL_ID,
+        "vf":    VERIFIED_FAN_ALERT_CHANNEL_ID,
+        "tour":  TOUR_SCAN_ALERT_CHANNEL_ID,
+        "drop":  DROP_CATCHER_CHANNEL_ID,
+    }
+    target_id = _channel_ids.get(prefer, 0) or DEFAULT_CHANNEL_ID
+    ch = await _get_channel(target_id)
+    if not ch:
+        logger.warning("post_rich: no channel configured (%s)", prefer)
+        return
+    try:
+        send_kwargs: Dict[str, Any] = {"embed": embed}
+        if content:
+            send_kwargs["content"] = content
+        if view:
+            send_kwargs["view"] = view
+        await ch.send(**send_kwargs)
+    except Exception as e:
+        logger.warning("post_rich channel send failed: %s", e)
 
 async def post_message(content: str, *, prefer: str = "default") -> None:
     """
@@ -525,8 +632,14 @@ def _tour_full_intel_message(item: Dict[str, Any]) -> str:
 
     lines.append("")
     lines.append("**On-sale dates**")
-    lines.append("• Presale: (add enrichment next)")
-    lines.append("• General sale: (add enrichment next)")
+    presale = (item.get("presale_date") or item.get("presale") or "").strip()
+    sale = (item.get("onsale_date") or item.get("general_sale") or item.get("sale_date") or "").strip()
+    if presale:
+        lines.append(f"• Presale: {presale}")
+    if sale:
+        lines.append(f"• General sale: {sale}")
+    if not presale and not sale:
+        lines.append("• Check artist/venue site for exact on-sale times")
 
     return _safe_truncate("\n".join(lines).strip(), 1900)
 
@@ -782,10 +895,15 @@ async def _intel_v1(artist: str) -> str:
             if url:
                 lines.append(f"  Tickets: {url}")
 
-    lines.append("")
-    lines.append("**Links (best-effort)**")
-    lines.append("• Official site: (add via Tavily/Google agent enrichment next)")
-    lines.append("• Presales: (add via Tavily/Google agent enrichment next)")
+    official = (item.get("official_url") or item.get("artist_url") or "").strip()
+    presale_url = (item.get("presale_url") or "").strip()
+    if official or presale_url:
+        lines.append("")
+        lines.append("**Links**")
+        if official:
+            lines.append(f"• Official site: {official}")
+        if presale_url:
+            lines.append(f"• Presales: {presale_url}")
 
     return _safe_truncate("\n".join(lines), 1900)
 
@@ -823,8 +941,21 @@ async def _start_drop_catcher() -> None:
         logger.info("drop_catcher: ticketmaster agent unavailable; skipping.")
         return
 
-    async def _discord_post(msg: str) -> None:
-        await post_message(msg, prefer="drop")
+    async def _discord_post(payload) -> None:
+        if isinstance(payload, dict):
+            if _EMBED_BUILDER_OK:
+                try:
+                    embed, view = build_alert(payload, link_only=False)
+                    role_id = os.getenv("DROP_PING_ROLE_ID", "")
+                    content = f"<@&{role_id}>" if role_id else ""
+                    await post_rich(embed, view, content=content, prefer="drop")
+                except Exception as e:
+                    logger.warning("drop_catcher embed build failed: %s", e)
+                    await post_message(payload.get("text", str(payload)), prefer="drop")
+            else:
+                await post_message(payload.get("text", str(payload)), prefer="drop")
+        else:
+            await post_message(str(payload), prefer="drop")
         STATUS["last_posts"]["drop_catcher_unix"] = time.time()
 
     stop_event = asyncio.Event()
@@ -834,6 +965,42 @@ async def _start_drop_catcher() -> None:
     )
     _task_guard("drop_catcher", task)
     logger.info("Drop catcher loop started (%ss).", DROP_CATCHER_POLL_SECONDS)
+
+
+async def _start_platform_monitor() -> None:
+    if platform_monitor is None:
+        logger.info("platform_monitor not available; skipping.")
+        return
+    if not getattr(platform_monitor, "is_available", lambda: False)():
+        logger.info("platform_monitor: requests or db unavailable; skipping.")
+        return
+
+    async def _platform_discord_post(payload) -> None:
+        if isinstance(payload, dict):
+            if _EMBED_BUILDER_OK:
+                try:
+                    embed, view = build_alert(payload, link_only=False)
+                    role_id = os.getenv("DROP_PING_ROLE_ID", "")
+                    content = f"<@&{role_id}>" if role_id else ""
+                    await post_rich(embed, view, content=content, prefer="drop")
+                except Exception as e:
+                    logger.warning("platform_monitor embed build failed: %s", e)
+                    await post_message(payload.get("text", str(payload)), prefer="drop")
+            else:
+                await post_message(payload.get("text", str(payload)), prefer="drop")
+        else:
+            await post_message(str(payload), prefer="drop")
+        STATUS["last_posts"]["platform_monitor_unix"] = time.time()
+
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        platform_monitor.platform_watch_loop(
+            discord_post=_platform_discord_post, stop_event=stop_event
+        ),
+        name="platform_monitor",
+    )
+    _task_guard("platform_monitor", task)
+    logger.info("Platform monitor loop started.")
 
 
 async def _daily_digest_loop() -> None:
@@ -1198,6 +1365,37 @@ async def drop_remove_cmd(interaction: discord.Interaction, event_id: str) -> No
         await interaction.followup.send(f"❌ drop_remove failed: {e}", ephemeral=True)
 
 
+@tree.command(name="drop_aggressive", description="Manually register an event for aggressive 3s polling before its on-sale time.")
+@app_commands.describe(
+    event_id="TM event ID to target",
+    onsale_in_minutes="Minutes until on-sale starts (e.g. 10 means T-10min from now)",
+    event_url="Direct link to the event (optional, used for pre-warming)",
+)
+async def drop_aggressive_cmd(
+    interaction: discord.Interaction,
+    event_id: str,
+    onsale_in_minutes: float,
+    event_url: Optional[str] = "",
+) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    if not drop_catcher or not hasattr(drop_catcher, "register_aggressive_target"):
+        await interaction.followup.send("❌ drop_catcher not available.", ephemeral=True)
+        return
+    if onsale_in_minutes <= 0:
+        await interaction.followup.send("❌ onsale_in_minutes must be > 0.", ephemeral=True)
+        return
+    try:
+        onsale_unix = time.time() + onsale_in_minutes * 60
+        drop_catcher.register_aggressive_target(event_id.strip(), onsale_unix, url=event_url or "")
+        await interaction.followup.send(
+            f"✅ Aggressive mode armed for `{event_id}` — on-sale in **{onsale_in_minutes:.0f} min**.\n"
+            f"Polling every {drop_catcher.AGGRESSIVE_POLL_SECONDS}s. Pre-warm fires at T-60s.",
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.followup.send(f"❌ drop_aggressive failed: {e}", ephemeral=True)
+
+
 @tree.command(name="drop_search", description="Search Ticketmaster events by artist then watch one for drops.")
 @app_commands.describe(artist="Artist name to search", limit="Max results (default 8)")
 async def drop_search_cmd(interaction: discord.Interaction, artist: str, limit: Optional[int] = 8) -> None:
@@ -1408,6 +1606,58 @@ async def tier_check_cmd(interaction: discord.Interaction) -> None:
 
 
 # ---------------------------------------------------------------------
+# Subscription expiry DM warnings
+# ---------------------------------------------------------------------
+
+async def _expiry_warning_loop() -> None:
+    """
+    Runs every 12 hours.
+    Sends a Discord DM to users whose subscription expires in exactly 7 or 3 days.
+    Requires dashboard db to be reachable and client discord_id to be set.
+    """
+    await client.wait_until_ready()
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dashboard"))
+        import db as _dashboard_db
+    except Exception as _e:
+        logger.warning("expiry_warning_loop: cannot import dashboard db: %s", _e)
+        return
+
+    CHECK_INTERVAL = 12 * 3600  # 12 hours
+
+    while not client.is_closed():
+        try:
+            for days_left in (7, 3):
+                clients = _dashboard_db.get_clients_expiring_in(days_left)
+                for c in clients:
+                    discord_id = c.get("discord_id")
+                    if not discord_id:
+                        continue
+                    try:
+                        user_obj = await client.fetch_user(int(discord_id))
+                        dm = await user_obj.create_dm()
+                        tier = (c.get("tier") or "tester").title()
+                        await dm.send(
+                            f"⚠️ **Viking AI — Subscription Expiry Warning**\n\n"
+                            f"Your **{tier}** plan expires in **{days_left} day{'s' if days_left != 1 else ''}**.\n\n"
+                            f"To renew, contact the admin or redeem a code at your dashboard.\n"
+                            f"Access will be locked immediately on expiry — no grace period."
+                        )
+                        logger.info(
+                            "expiry_warning_loop: sent %dd warning to discord_id=%s", days_left, discord_id
+                        )
+                    except Exception as dm_err:
+                        logger.debug(
+                            "expiry_warning_loop: DM failed for discord_id=%s: %s", discord_id, dm_err
+                        )
+        except Exception as loop_err:
+            logger.warning("expiry_warning_loop: error: %s", loop_err)
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+# ---------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------
 @client.event
@@ -1425,6 +1675,9 @@ async def on_ready() -> None:
     # Start drop catcher loop (async)
     await _start_drop_catcher()
 
+    # Start multi-platform monitor loop (async)
+    await _start_platform_monitor()
+
     # Daily drop digest loop
     t_digest = asyncio.create_task(_daily_digest_loop(), name="daily_digest")
     _task_guard("daily_digest", t_digest)
@@ -1435,6 +1688,10 @@ async def on_ready() -> None:
 
     t_price = asyncio.create_task(_price_monitor_loop(), name="price_monitor_loop")
     _task_guard("price_monitor_loop", t_price)
+
+    # Subscription expiry DM warnings (7d + 3d)
+    t_expiry = asyncio.create_task(_expiry_warning_loop(), name="expiry_warning_loop")
+    _task_guard("expiry_warning_loop", t_expiry)
 
 def main() -> None:
     client.run(DISCORD_TOKEN)

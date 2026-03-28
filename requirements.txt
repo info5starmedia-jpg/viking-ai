@@ -1,0 +1,17 @@
+# Viking AI — root requirements (bot + all modules)
+# Install with: pip install -r requirements.txt
+
+# Discord bot
+discord.py>=2.3.0
+
+# HTTP / scraping
+requests>=2.31.0
+curl_cffi>=0.6.0          # TLS/JA3 browser impersonation for stealth scraping (optional but recommended)
+
+# Env / config
+python-dotenv>=1.0.0
+
+# Dashboard (Flask web UI)
+flask>=3.0.0
+authlib>=1.3.0
+stripe>=8.0.0

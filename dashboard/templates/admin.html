@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin — Viking AI</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="app-layout">
+
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <span class="logo-icon">⚡</span><span>Viking AI</span>
+    </div>
+    <nav class="sidebar-nav">
+      <div class="nav-label">Admin</div>
+      <a href="/admin" class="nav-link active"><span class="nav-icon">📊</span> Overview</a>
+      <a href="#invites"   class="nav-link"><span class="nav-icon">🎟</span> Invite Codes</a>
+      <a href="#hotpicks"  class="nav-link"><span class="nav-icon">🔥</span> Hot Picks</a>
+      <a href="#watchlist" class="nav-link"><span class="nav-icon">⭐</span> Global Watchlist</a>
+      <a href="#audit"     class="nav-link"><span class="nav-icon">📋</span> Audit Log</a>
+      <div class="nav-label" style="margin-top:16px;">Client</div>
+      <a href="/dashboard" class="nav-link"><span class="nav-icon">🎯</span> My Setup</a>
+    </nav>
+    <div class="sidebar-user">
+      {% if user.avatar_url %}<img src="{{ user.avatar_url }}" alt="avatar" class="user-avatar">
+      {% else %}<div class="user-avatar-placeholder">{{ user.display_name[0]|upper }}</div>{% endif %}
+      <div class="user-info">
+        <div class="user-name">{{ user.display_name }}</div>
+        <div class="user-email" style="color:var(--accent);font-weight:600;">Admin</div>
+      </div>
+      <a href="/logout" class="logout-btn" title="Sign out">↩</a>
+    </div>
+  </aside>
+
+  <main class="main-content" style="max-width:1100px;">
+
+    <div class="page-header">
+      <h1 class="page-title">Admin Overview</h1>
+      <p class="page-subtitle">Platform-wide stats, clients, invite codes, and audit log.</p>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}<div class="flash-container">{% for cat, msg in messages %}
+        <div class="flash flash-{{ 'error' if cat=='error' else 'success' if cat=='success' else 'info' }}" role="alert" aria-live="polite">
+          {{ '✓' if cat=='success' else '⚠' if cat=='error' else 'ℹ' }} {{ msg }}
+          <button class="flash-close" onclick="this.parentElement.remove()" aria-label="Dismiss">×</button>
+        </div>{% endfor %}</div>{% endif %}
+    {% endwith %}
+
+    <!-- Stats Grid -->
+    <div class="stats-grid">
+      <div class="stat-card green">
+        <div class="stat-label">Active Clients</div>
+        <div class="stat-value">{{ stats.total_clients }}</div>
+        <div class="stat-sub">Signed-up users</div>
+      </div>
+      <div class="stat-card accent">
+        <div class="stat-label">URLs Monitored</div>
+        <div class="stat-value">{{ stats.total_monitors }}</div>
+        <div class="stat-sub">Across all clients</div>
+      </div>
+      {% for tier, cnt in stats.tier_counts.items() %}
+      <div class="stat-card">
+        <div class="stat-label">{{ tier|title }}</div>
+        <div class="stat-value">{{ cnt }}</div>
+        <div class="stat-sub">clients</div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- Top 5 URLs -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">🔥</span> Top 5 Most-Monitored URLs</span>
+        <span class="card-badge">by unique clients</span>
+      </div>
+      <div class="card-body no-pad">
+        {% if stats.top_urls %}
+        <table class="data-table">
+          <thead><tr><th>Rank</th><th>URL</th><th>Clients Watching</th></tr></thead>
+          <tbody>
+          {% for row in stats.top_urls %}
+          <tr>
+            <td style="width:48px;font-weight:700;color:var(--accent);">
+              {% if loop.index==1 %}🥇{% elif loop.index==2 %}🥈{% elif loop.index==3 %}🥉{% else %}#{{ loop.index }}{% endif %}
+            </td>
+            <td><a href="{{ row.url }}" target="_blank" rel="noopener" class="cell-url" title="{{ row.url }}">{{ row.url }}</a></td>
+            <td><span class="badge badge-green">{{ row.client_count }} client{{ 's' if row.client_count != 1 }}</span></td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state"><div class="empty-icon">🔥</div>No monitors added yet.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- All Clients -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">👥</span> All Clients</span>
+        <span class="card-badge">{{ stats.all_clients|length }} total</span>
+      </div>
+      <div class="card-body no-pad">
+        {% if stats.all_clients %}
+        <table class="data-table">
+          <thead><tr><th>Client</th><th>Email</th><th>Tier</th><th>Status</th><th>Monitors</th><th>Proxies</th><th>Code</th><th>Joined</th><th>Actions</th></tr></thead>
+          <tbody>
+          {% for c in stats.all_clients %}
+          <tr>
+            <td><a href="/admin/client/{{ c.id }}" style="font-weight:500;color:var(--text);">{{ c.display_name or '—' }}</a></td>
+            <td class="cell-mono" style="font-size:.77rem;">{{ c.email or '—' }}</td>
+            <td>
+              <span class="badge {% if c.tier=='unlimited' %}badge-green{% elif c.tier=='pro' %}badge-yellow{% elif c.tier=='starter' %}badge-grey{% else %}badge-grey{% endif %}">
+                {{ c.tier|title }}
+              </span>
+            </td>
+            <td>
+              {% if c.sub_status in ('active','trialing') %}<span class="badge badge-green"><span class="badge-dot"></span>Active</span>
+              {% elif c.sub_status == 'past_due' %}<span class="badge badge-yellow"><span class="badge-dot"></span>Past Due</span>
+              {% elif c.sub_status == 'canceled' %}<span class="badge badge-red"><span class="badge-dot"></span>Canceled</span>
+              {% else %}<span class="badge badge-grey">{{ c.sub_status }}</span>{% endif %}
+            </td>
+            <td>{{ c.monitor_count }}</td>
+            <td>{{ c.proxy_count }}</td>
+            <td class="cell-mono" style="font-size:.75rem;">{{ c.invite_code or '—' }}</td>
+            <td style="color:var(--text-muted);font-size:.8rem;">{{ c.created_at|ts }}</td>
+            <td>
+              <a href="/admin/client/{{ c.id }}" class="btn btn-ghost btn-sm">Detail</a>
+              {% if c.active %}
+              <form action="/admin/client/{{ c.id }}/toggle" method="POST" style="display:inline;">
+                <input type="hidden" name="active" value="0">
+                <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Disable?')">Disable</button>
+              </form>
+              {% else %}
+              <form action="/admin/client/{{ c.id }}/toggle" method="POST" style="display:inline;">
+                <input type="hidden" name="active" value="1">
+                <button type="submit" class="btn btn-ghost btn-sm">Enable</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state"><div class="empty-icon">👥</div>No clients yet.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Invite Codes -->
+    <div id="invites" class="card">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">🎟</span> Invite Codes</span>
+        <span class="card-badge">{{ stats.invite_codes|length }} total</span>
+      </div>
+
+      <!-- Create form -->
+      <div class="card-body" style="border-bottom:1px solid var(--border);">
+        <form action="/admin/invite/create" method="POST">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Tier</label>
+              <select name="tier" style="background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text);padding:9px 12px;font-family:var(--font);font-size:.875rem;">
+                <option value="tester">Tester (Free)</option>
+                <option value="starter">Starter ($80/mo)</option>
+                <option value="pro">Pro ($100/mo)</option>
+                <option value="unlimited">Unlimited ($300/mo)</option>
+              </select>
+            </div>
+            <div class="form-group" style="max-width:120px;">
+              <label>Max Uses</label>
+              <input type="number" name="max_uses" value="1" min="1" max="1000">
+            </div>
+            <div class="form-group" style="max-width:140px;">
+              <label>Expires (days)</label>
+              <input type="number" name="expires_days" placeholder="∞ never" min="1">
+            </div>
+            <div class="form-group" style="flex:2;">
+              <label>Note</label>
+              <input type="text" name="note" placeholder="e.g. Beta tester — John">
+            </div>
+            <div class="form-group" style="align-self:flex-end;flex:0 0 auto;">
+              <button type="submit" class="btn btn-primary">Generate Code</button>
+            </div>
+          </div>
+        </form>
+      </div>
+
+      <!-- Codes table -->
+      <div class="card-body no-pad">
+        {% if stats.invite_codes %}
+        <table class="data-table">
+          <thead><tr><th>Code</th><th>Tier</th><th>Uses</th><th>Expires</th><th>Note</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody>
+          {% for ic in stats.invite_codes %}
+          <tr>
+            <td class="cell-mono" style="font-size:.82rem;letter-spacing:.03em;">{{ ic.code }}</td>
+            <td><span class="badge badge-grey">{{ ic.tier|title }}</span></td>
+            <td style="color:var(--text-muted);">{{ ic.uses_count }}/{{ ic.max_uses }}</td>
+            <td style="color:var(--text-muted);font-size:.8rem;">{{ ic.expires_at|ts if ic.expires_at else '∞' }}</td>
+            <td style="color:var(--text-muted);font-size:.82rem;">{{ ic.note or '—' }}</td>
+            <td>
+              {% if ic.active %}<span class="badge badge-green"><span class="badge-dot"></span>Active</span>
+              {% else %}<span class="badge badge-red"><span class="badge-dot"></span>Inactive</span>{% endif %}
+            </td>
+            <td style="display:flex;gap:6px;flex-wrap:wrap;">
+              {% if ic.active %}
+              <form action="/admin/invite/{{ ic.code }}/deactivate" method="POST" style="display:inline;">
+                <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('Deactivate?')">Deactivate</button>
+              </form>
+              <form action="/admin/invite/{{ ic.code }}/extend" method="POST" style="display:inline;display:flex;gap:4px;">
+                <input type="number" name="days" value="7" min="1" style="width:52px;padding:5px 6px;font-size:.78rem;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);">
+                <button type="submit" class="btn btn-ghost btn-sm">+Days</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state"><div class="empty-icon">🎟</div>No invite codes yet.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Hot Picks -->
+    <div id="hotpicks" class="card">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">🔥</span> Hot Picks</span>
+        <span class="card-badge">{{ hot_picks|selectattr('active','equalto',1)|list|length }} active</span>
+      </div>
+      <div class="card-body" style="border-bottom:1px solid var(--border);">
+        <form action="/admin/hotpick/add" method="POST">
+          <div class="form-row" style="flex-wrap:wrap;">
+            <div class="form-group" style="flex:1;min-width:160px;">
+              <label>Artist</label>
+              <input type="text" name="artist" placeholder="e.g. Taylor Swift" required>
+            </div>
+            <div class="form-group" style="flex:2;min-width:200px;">
+              <label>Note (shown to all users)</label>
+              <input type="text" name="note" placeholder="e.g. Major tour going on sale soon!">
+            </div>
+            <div class="form-group" style="flex:1;min-width:160px;">
+              <label>Image URL (optional)</label>
+              <input type="url" name="image_url" placeholder="https://...">
+            </div>
+            <div class="form-group" style="align-self:flex-end;flex:0 0 auto;">
+              <button type="submit" class="btn btn-primary">+ Add</button>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="card-body no-pad">
+        {% if hot_picks %}
+        <table class="data-table">
+          <thead><tr><th>Artist</th><th>Note</th><th>Status</th><th>Added</th><th></th></tr></thead>
+          <tbody>
+          {% for pick in hot_picks %}
+          <tr style="{{ 'opacity:0.45;' if not pick.active }}">
+            <td style="font-weight:700;color:var(--accent);">{{ pick.artist }}</td>
+            <td style="font-size:.82rem;color:var(--text-muted);">{{ pick.note or '—' }}</td>
+            <td>{% if pick.active %}<span class="badge badge-green"><span class="badge-dot"></span>Active</span>
+                {% else %}<span class="badge badge-grey">Inactive</span>{% endif %}</td>
+            <td style="font-size:.78rem;color:var(--text-muted);">{{ pick.created_at|ts }}</td>
+            <td>{% if pick.active %}
+              <form action="/admin/hotpick/{{ pick.id }}/deactivate" method="POST" onsubmit="return confirm('Remove hot pick?')">
+                <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+              </form>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state"><div class="empty-icon">🔥</div>No hot picks yet. Flag artists above to alert all users.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Global Watchlist -->
+    <div id="watchlist" class="card">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">⭐</span> Global Watchlist</span>
+        <span class="card-badge">{{ global_watchlist|selectattr('active','equalto',1)|list|length }} active</span>
+      </div>
+      <div class="card-body" style="border-bottom:1px solid var(--border);">
+        <form action="/admin/watchlist/add" method="POST">
+          <div class="form-row">
+            <div class="form-group" style="flex:1;">
+              <label>Artist</label>
+              <input type="text" name="artist" placeholder="e.g. Beyoncé" required>
+            </div>
+            <div class="form-group" style="flex:2;">
+              <label>Note (internal)</label>
+              <input type="text" name="note" placeholder="Optional admin note">
+            </div>
+            <div class="form-group" style="align-self:flex-end;flex:0 0 auto;">
+              <button type="submit" class="btn btn-primary">+ Add</button>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="card-body no-pad">
+        {% if global_watchlist %}
+        <table class="data-table">
+          <thead><tr><th>Artist</th><th>Note</th><th>Status</th><th>Added</th><th></th></tr></thead>
+          <tbody>
+          {% for wl in global_watchlist %}
+          <tr style="{{ 'opacity:0.45;' if not wl.active }}">
+            <td style="font-weight:600;">{{ wl.artist }}</td>
+            <td style="font-size:.82rem;color:var(--text-muted);">{{ wl.note or '—' }}</td>
+            <td>{% if wl.active %}<span class="badge badge-green"><span class="badge-dot"></span>Active</span>
+                {% else %}<span class="badge badge-grey">Removed</span>{% endif %}</td>
+            <td style="font-size:.78rem;color:var(--text-muted);">{{ wl.created_at|ts }}</td>
+            <td>{% if wl.active %}
+              <form action="/admin/watchlist/remove/{{ wl.id }}" method="POST" onsubmit="return confirm('Remove?')">
+                <button type="submit" class="btn btn-danger btn-sm">Remove</button>
+              </form>{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state"><div class="empty-icon">⭐</div>No global watchlist entries. Add artists to monitor across all client dashboards.</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Audit Log -->
+    <div id="audit" class="card">
+      <div class="card-header">
+        <span class="card-title"><span class="icon">📋</span> Audit Log</span>
+        <span class="card-badge">last 50</span>
+      </div>
+      <div class="card-body no-pad">
+        {% if stats.audit_log %}
+        <table class="data-table">
+          <thead><tr><th>Time</th><th>Admin</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
+          <tbody>
+          {% for entry in stats.audit_log %}
+          <tr>
+            <td style="color:var(--text-muted);font-size:.78rem;white-space:nowrap;">{{ entry.created_at|ts_full }}</td>
+            <td style="font-size:.82rem;">{{ entry.admin_name or '—' }}</td>
+            <td class="cell-mono" style="font-size:.78rem;color:var(--accent);">{{ entry.action }}</td>
+            <td style="font-size:.8rem;color:var(--text-muted);">{{ entry.target or '—' }}</td>
+            <td style="font-size:.8rem;color:var(--text-muted);">{{ entry.detail or '—' }}</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <div class="empty-state"><div class="empty-icon">📋</div>No audit entries yet.</div>
+        {% endif %}
+      </div>
+    </div>
+
+  </main>
+</div>
+</body>
+</html>
