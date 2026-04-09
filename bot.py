@@ -644,9 +644,28 @@ def _tour_full_intel_message(item: Dict[str, Any]) -> str:
     return _safe_truncate("\n".join(lines).strip(), 1900)
 
 def _tour_scan_post_callback(item: Dict[str, Any]) -> str:
-    if TOUR_SCAN_MODE == "full":
-        return _tour_full_intel_message(item)
-    return _tour_fast_message(item)
+    """Build the Discord message for a new tour RSS item.
+
+    Checks the global watchlist so watched artists get a 🎯 badge.
+    """
+    title = (item.get("title") or "").lower()
+    watched_badge = ""
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "dashboard"))
+        from db import get_global_watchlist as _gwl
+        for entry in (_gwl() or []):
+            artist = (entry.get("artist") or "").strip().lower()
+            if artist and artist in title:
+                watched_badge = "🎯 **Watched artist** — "
+                break
+    except Exception:
+        pass
+
+    msg = _tour_full_intel_message(item) if TOUR_SCAN_MODE == "full" else _tour_fast_message(item)
+    if watched_badge and not msg.startswith(watched_badge):
+        msg = watched_badge + msg
+    return msg
 
 def _start_tour_scan_monitor() -> None:
     if not tour_scan_monitor:
