@@ -1,26 +1,134 @@
 services:
-  - type: web
+  # ─── Discord Bot ────────────────────────────────────────────────────────────
+  - type: worker
     name: viking-ai-bot
     env: python
-    region: oregon  # choose your closest region
-    buildCommand: |
-      pip install --upgrade pip
-      pip install -r requirements.txt
+    region: oregon
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: python bot.py
-    plan: free
+    plan: starter
     autoDeploy: true
     envVars:
+      # --- Discord ---
       - key: DISCORD_TOKEN
         sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      # --- Ticketmaster ---
       - key: TICKETMASTER_API_KEY
         sync: false
+      # --- Apify (multi-source fallback) ---
+      - key: APIFY_API_TOKEN
+        sync: false
+      # --- AI / Search APIs ---
       - key: OPENAI_API_KEY
         sync: false
       - key: GOOGLE_API_KEY
         sync: false
+      - key: GOOGLE_CSE_ID
+        sync: false
+      - key: TAVILY_API_KEY
+        sync: false
+      # --- Streaming metrics ---
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
+      # --- TikTok ---
+      - key: TIKTOK_API_KEY
+        sync: false
+      # --- Drop Catcher ---
+      - key: DROP_CATCHER_WEBHOOK_URL
+        sync: false
+      - key: DROP_CATCHER_CHANNEL_ID
+        sync: false
+      - key: DROP_CATCHER_POLL_SECONDS
+        value: "300"
+      - key: AGGRESSIVE_ENABLED
+        value: "1"
+      - key: AGGRESSIVE_WINDOW_SECS
+        value: "300"
+      - key: AGGRESSIVE_POLL_SECONDS
+        value: "3"
+      # --- Tour scan ---
+      - key: TOUR_SCAN_RSS_URLS
+        sync: false
+      - key: TOUR_SCAN_WEBHOOK_URL
+        sync: false
+      - key: TOUR_SCAN_INTERVAL_SECONDS
+        value: "3600"
+      - key: TOUR_SCAN_MODE
+        value: "fast"
+      # --- Platform monitor ---
+      - key: PLATFORM_MONITOR_INTERVAL
+        value: "300"
+      # --- Canva / ElevenLabs ---
       - key: CANVA_API_KEY
         sync: false
       - key: ELEVENLABS_API_KEY
         sync: false
-      - key: TAVILY_API_KEY
+      # --- Database ---
+      - key: VIKING_DB_PATH
+        value: /opt/data/viking_ai.sqlite
+      - key: TOUR_SCAN_SEEN_PATH
+        value: /opt/data/tour_scan_seen.json
+      - key: DASHBOARD_DB_PATH
+        value: /opt/data/dashboard.sqlite
+
+  # ─── Dashboard (Flask) ─────────────────────────────────────────────────────
+  - type: web
+    name: viking-ai-dashboard
+    env: python
+    region: oregon
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      pip install -r dashboard/requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 "dashboard.app:app"
+    plan: starter
+    autoDeploy: true
+    envVars:
+      # --- Flask ---
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: FLASK_ENV
+        value: production
+      # --- Discord OAuth ---
+      - key: DISCORD_CLIENT_ID
         sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      - key: DISCORD_REDIRECT_URI
+        sync: false
+      # --- Google OAuth (optional) ---
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      # --- Admin ---
+      - key: ADMIN_DISCORD_IDS
+        sync: false
+      # --- Stripe ---
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_STARTER_PRICE_ID
+        sync: false
+      - key: STRIPE_PRO_PRICE_ID
+        sync: false
+      - key: STRIPE_UNLIMITED_PRICE_ID
+        sync: false
+      - key: STRIPE_ALERT_WEBHOOK_URL
+        sync: false
+      # --- Ticketmaster (for dashboard price history polling) ---
+      - key: TICKETMASTER_API_KEY
+        sync: false
+      # --- Apify ---
+      - key: APIFY_API_TOKEN
+        sync: false
+      # --- Database ---
+      - key: DASHBOARD_DB_PATH
+        value: /opt/data/dashboard.sqlite
