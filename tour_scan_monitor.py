@@ -9,6 +9,17 @@ logger = logging.getLogger("tour_scan")
 
 # ========= ENV =========
 TOUR_SCAN_RSS_URLS = (os.getenv("TOUR_SCAN_RSS_URLS") or "").strip()
+
+# Default RSS feeds used when TOUR_SCAN_RSS_URLS is not set.
+# Covers major music news sources that publish tour/concert announcements.
+_DEFAULT_RSS_FEEDS = [
+    "https://www.billboard.com/feed/",                        # Billboard (tours, concerts)
+    "https://pitchfork.com/rss/news/",                        # Pitchfork news
+    "https://loudwire.com/feed/",                             # Rock/metal tours
+    "https://www.spin.com/feed/",                             # SPIN magazine
+    "https://consequence.net/feed/",                          # Consequence of Sound
+    "https://www.nme.com/news/music/feed",                    # NME news
+]
 TOUR_SCAN_SEEN_PATH = os.getenv("TOUR_SCAN_SEEN_PATH", "/opt/viking-ai/data/tour_scan_seen.json")
 TOUR_SCAN_PREFIX = (os.getenv("TOUR_SCAN_PREFIX") or "[TOUR]").strip()
 TOUR_SCAN_WEBHOOK_URL = (os.getenv("TOUR_SCAN_WEBHOOK_URL") or "").strip()
@@ -125,7 +136,8 @@ def fetch_rss(url: str) -> List[Dict[str, str]]:
 def _current_feeds() -> List[str]:
     # Read env each time so a restart picks up changes cleanly.
     rss_urls = (os.getenv("TOUR_SCAN_RSS_URLS") or TOUR_SCAN_RSS_URLS or "").strip()
-    return [u.strip() for u in rss_urls.split(",") if u.strip()]
+    feeds = [u.strip() for u in rss_urls.split(",") if u.strip()]
+    return feeds if feeds else list(_DEFAULT_RSS_FEEDS)
 
 
 def _effective_interval_seconds(passed_interval: int) -> int:
