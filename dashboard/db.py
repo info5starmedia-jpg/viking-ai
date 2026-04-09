@@ -144,6 +144,16 @@ def init_db() -> None:
                 active     INTEGER DEFAULT 1,
                 created_at REAL
             );
+
+            CREATE TABLE IF NOT EXISTS dc_price_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                monitor_id  INTEGER NOT NULL REFERENCES dc_monitors(id) ON DELETE CASCADE,
+                price_min   REAL,
+                price_max   REAL,
+                recorded_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_price_history_monitor
+                ON dc_price_history (monitor_id, recorded_at DESC);
         """)
         # Migrate dc_monitors with new columns (ALTER TABLE doesn't support IF NOT EXISTS)
         for col, definition in [
@@ -673,7 +683,22 @@ def update_monitor_price(monitor_id: int, price_min: Optional[float], price_max:
             "UPDATE dc_monitors SET last_price_min=?, last_price_max=?, last_checked=? WHERE id=?",
             (price_min, price_max, now, monitor_id),
         )
+        conn.execute(
+            "INSERT INTO dc_price_history (monitor_id, price_min, price_max, recorded_at) VALUES (?,?,?,?)",
+            (monitor_id, price_min, price_max, now),
+        )
         conn.commit()
+
+
+def get_price_history(monitor_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+    """Return recent price snapshots for a monitor, newest first."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT price_min, price_max, recorded_at FROM dc_price_history "
+            "WHERE monitor_id=? ORDER BY recorded_at DESC LIMIT ?",
+            (monitor_id, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_monitors_by_platform(platform: str) -> List[Dict[str, Any]]:

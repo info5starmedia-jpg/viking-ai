@@ -76,6 +76,11 @@ try:
 except Exception:
     _analyze_arbitrage = None  # type: ignore
 
+try:
+    import apify_client as _apify  # type: ignore
+except Exception:
+    _apify = None  # type: ignore
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -178,10 +183,63 @@ def _tm_get(params: Dict[str, Any]) -> Dict[str, Any]:
     return resp.json()
 
 
+# Track consecutive TM API failures for Apify fallback decision
+_TM_FAIL_COUNT = 0
+_TM_FAIL_RESET_AT = 0.0
+_TM_FAIL_THRESHOLD = 3       # switch to Apify after this many consecutive failures
+_TM_FAIL_COOLDOWN  = 900.0   # seconds before retrying TM API after fallback
+
+
+def _tm_get_with_fallback(params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    TM API call with Apify fallback on rate-limit / server errors.
+
+    On 429 or 5xx, increments a failure counter. After _TM_FAIL_THRESHOLD
+    consecutive failures, routes subsequent calls through the Apify
+    Ticketmaster scraper until _TM_FAIL_COOLDOWN has elapsed.
+    """
+    global _TM_FAIL_COUNT, _TM_FAIL_RESET_AT
+    now = time.time()
+
+    # If we're in cooldown and Apify is available, use it
+    if _TM_FAIL_COUNT >= _TM_FAIL_THRESHOLD and now < _TM_FAIL_RESET_AT:
+        if _apify and _apify.is_available():
+            keyword = params.get("keyword") or params.get("q") or ""
+            logger.info("drop_catcher: TM rate-limited — using Apify fallback (keyword=%r)", keyword)
+            raw_items = _apify.search_tm_events(keyword=keyword, max_items=int(params.get("size", 20)))
+            if raw_items:
+                # Wrap in TM Discovery API response envelope so callers work unchanged
+                return {"_embedded": {"events": raw_items}, "page": {"totalPages": 1, "number": 0}}
+        logger.debug("drop_catcher: TM in cooldown but Apify unavailable; trying TM anyway")
+
+    try:
+        result = _tm_get(params)
+        # Success — reset failure counter
+        _TM_FAIL_COUNT = 0
+        return result
+    except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", 0)
+        if status in (429, 500, 502, 503, 504) or "429" in str(e) or "rate" in str(e).lower():
+            _TM_FAIL_COUNT += 1
+            _TM_FAIL_RESET_AT = now + _TM_FAIL_COOLDOWN
+            logger.warning(
+                "drop_catcher: TM API error %s (fail_count=%d); %s",
+                status or e, _TM_FAIL_COUNT,
+                "switching to Apify" if _TM_FAIL_COUNT >= _TM_FAIL_THRESHOLD else "will retry",
+            )
+            # Immediate Apify fallback if already at threshold
+            if _TM_FAIL_COUNT >= _TM_FAIL_THRESHOLD and _apify and _apify.is_available():
+                keyword = params.get("keyword") or params.get("q") or ""
+                raw_items = _apify.search_tm_events(keyword=keyword, max_items=int(params.get("size", 20)))
+                if raw_items:
+                    return {"_embedded": {"events": raw_items}, "page": {"totalPages": 1, "number": 0}}
+        raise
+
+
 def _paginate_events(params: Dict[str, Any], max_results: int = 200) -> List[Dict[str, Any]]:
     """
     Paginate TM Discovery events. Respects TM's (page * size) < 1000 limit.
-    Pulled from tm_scraper_change_tracking._paginate_events pattern.
+    Uses Apify as automatic fallback on rate-limit/server errors.
     """
     all_events: List[Dict[str, Any]] = []
     size = int(params.get("size", 200))
@@ -193,7 +251,7 @@ def _paginate_events(params: Dict[str, Any], max_results: int = 200) -> List[Dic
         p = dict(params)
         p["page"] = page
         try:
-            data = _tm_get(p)
+            data = _tm_get_with_fallback(p)
         except Exception as e:
             logger.warning("drop_catcher: TM page %d error: %s", page, e)
             break

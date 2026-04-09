@@ -687,6 +687,30 @@ def admin_watchlist_remove(wl_id):
 
 
 # ---------------------------------------------------------------------------
+# Price history API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/monitors/<int:monitor_id>/price_history")
+@active_sub_required
+def api_price_history(monitor_id):
+    """Return up to 50 price snapshots for a monitor as JSON.
+    Only returns data if the monitor belongs to the logged-in client.
+    """
+    client = current_user()
+    # Verify ownership
+    with dashboard_db.connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM dc_monitors WHERE id=? AND client_id=?",
+            (monitor_id, client["id"]),
+        ).fetchone()
+    if not row:
+        return {"error": "not found"}, 404
+
+    history = dashboard_db.get_price_history(monitor_id, limit=50)
+    return {"monitor_id": monitor_id, "history": history}
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

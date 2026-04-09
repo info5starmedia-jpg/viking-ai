@@ -1605,6 +1605,68 @@ async def tier_check_cmd(interaction: discord.Interaction) -> None:
     await _send_ephemeral(interaction, f"This server is on tier: **{tier}**")
 
 
+@tree.command(name="price_history", description="Show price trend for a platform monitor (SeatGeek/StubHub/VividSeats).")
+@app_commands.describe(monitor_id="Monitor ID from your dashboard")
+async def price_history_cmd(interaction: discord.Interaction, monitor_id: int) -> None:
+    """Fetch and display recent price history for a monitor as a text chart."""
+    await interaction.response.defer(ephemeral=True)
+    try:
+        import sys as _sys, os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "dashboard"))
+        import db as _dash_db
+    except Exception as e:
+        await interaction.followup.send(f"❌ Dashboard DB unavailable: {e}", ephemeral=True)
+        return
+
+    try:
+        history = _dash_db.get_price_history(monitor_id, limit=20)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Could not fetch price history: {e}", ephemeral=True)
+        return
+
+    if not history:
+        await interaction.followup.send(
+            f"📊 No price history yet for monitor `{monitor_id}`.\n"
+            "Prices are recorded each time the platform monitor polls.",
+            ephemeral=True,
+        )
+        return
+
+    # Build a simple ASCII sparkline (newest last)
+    points = list(reversed(history))  # chronological order
+    prices = [p["price_min"] for p in points if p.get("price_min") is not None]
+
+    lines = [f"📊 **Price History — Monitor {monitor_id}** (last {len(points)} polls)\n"]
+
+    if prices:
+        mn, mx = min(prices), max(prices)
+        first, last = prices[0], prices[-1]
+        change = last - first
+        arrow = "📈" if change > 0 else ("📉" if change < 0 else "➡️")
+
+        lines.append(f"{arrow} `${first:.0f}` → `${last:.0f}` ({change:+.0f})")
+        lines.append(f"Range: `${mn:.0f}` – `${mx:.0f}`\n")
+
+        # Mini bar chart (10-char wide per row)
+        BARS = "▁▂▃▄▅▆▇█"
+        if mx > mn:
+            bar = "".join(BARS[min(7, int((p - mn) / (mx - mn) * 7))] for p in prices[-20:])
+        else:
+            bar = "▄" * len(prices[-20:])
+        lines.append(f"`{bar}`")
+
+    # Table of last 10 entries
+    lines.append("\n**Recent snapshots**")
+    import datetime as _dt
+    for p in points[-10:]:
+        ts = _dt.datetime.fromtimestamp(p["recorded_at"], tz=_dt.timezone.utc).strftime("%m/%d %H:%M")
+        pmin = f"${p['price_min']:.0f}" if p.get("price_min") is not None else "—"
+        pmax = f"${p['price_max']:.0f}" if p.get("price_max") is not None else "—"
+        lines.append(f"`{ts}` — {pmin}–{pmax}")
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
 # ---------------------------------------------------------------------
 # Subscription expiry DM warnings
 # ---------------------------------------------------------------------

@@ -100,6 +100,13 @@ def _browser_headers(idx: int = 0) -> dict:
     }
 
 try:
+    import apify_client as _apify  # type: ignore
+    _APIFY_OK = True
+except Exception:
+    _apify = None  # type: ignore
+    _APIFY_OK = False
+
+try:
     from dashboard.db import (  # type: ignore
         get_monitors_by_platform,
         update_monitor_price,
@@ -335,31 +342,38 @@ def poll_seatgeek_price(monitor: Dict[str, Any]) -> Optional[Tuple[Optional[floa
 
     # Fallback: scrape the page
     html = _get_html(url, proxies=proxies)
-    if not html:
-        return None
+    if html:
+        # Try JSON-LD
+        for jld in _extract_jsonld(html):
+            price = _find_price_in_obj(jld)
+            if price and price > 0:
+                name = ""
+                if isinstance(jld, dict):
+                    name = jld.get("name") or jld.get("title") or ""
+                return price, price, name or "Event", url
 
-    # Try JSON-LD
-    for jld in _extract_jsonld(html):
-        price = _find_price_in_obj(jld)
-        if price and price > 0:
-            # Extract event name from JSON-LD
-            name = ""
-            if isinstance(jld, dict):
-                name = jld.get("name") or jld.get("title") or ""
-            return price, price, name or "Event", url
+        # Try __NEXT_DATA__
+        nd = _extract_next_data(html)
+        if nd:
+            price = _find_price_in_obj(nd)
+            if price and price > 0:
+                return price, price, "Event", url
 
-    # Try __NEXT_DATA__
-    nd = _extract_next_data(html)
-    if nd:
-        price = _find_price_in_obj(nd)
-        if price and price > 0:
+        # Try plain text extraction for "From $XX"
+        m = re.search(r"From\s+\$(\d+(?:\.\d+)?)", html)
+        if m:
+            price = float(m.group(1))
             return price, price, "Event", url
 
-    # Try plain text extraction for "From $XX"
-    m = re.search(r"From\s+\$(\d+(?:\.\d+)?)", html)
-    if m:
-        price = float(m.group(1))
-        return price, price, "Event", url
+    # Apify fallback — handles JS-rendered pages and anti-bot blocks
+    if _apify and _apify.is_available():
+        logger.info("platform_monitor: SeatGeek page scrape failed, trying Apify for %s", url)
+        item = _apify.get_seatgeek_price(url)
+        if item:
+            price = _apify.extract_price_from_result(item)
+            name = _apify.extract_name_from_result(item)
+            if price:
+                return price, price, name, url
 
     return None
 
@@ -375,44 +389,52 @@ def _sh_event_id_from_url(url: str) -> Optional[str]:
 
 def poll_stubhub_price(monitor: Dict[str, Any]) -> Optional[Tuple[Optional[float], Optional[float], str, str]]:
     """
-    Poll a StubHub monitor URL for lowest listing price via page scrape.
+    Poll a StubHub monitor URL for lowest listing price.
+    Strategy: page scrape → Apify StubHub actor (fallback if page blocked).
     Returns (price_min, price_max, event_name, event_url) or None.
     """
     url = monitor.get("url", "")
     proxies = monitor.get("proxies") or []
 
     html = _get_html(url, proxies=proxies)
-    if not html:
-        return None
+    if html:
+        # Try JSON-LD first
+        for jld in _extract_jsonld(html):
+            if isinstance(jld, dict) and jld.get("@type") in ("Event", "MusicEvent"):
+                offers = jld.get("offers") or {}
+                if isinstance(offers, dict):
+                    price_min = offers.get("lowPrice") or offers.get("price")
+                    price_max = offers.get("highPrice") or price_min
+                    if price_min:
+                        name = jld.get("name") or "Event"
+                        return float(price_min), float(price_max or price_min), name, url
 
-    # Try JSON-LD first
-    for jld in _extract_jsonld(html):
-        if isinstance(jld, dict) and jld.get("@type") in ("Event", "MusicEvent"):
-            offers = jld.get("offers") or {}
-            if isinstance(offers, dict):
-                price_min = offers.get("lowPrice") or offers.get("price")
-                price_max = offers.get("highPrice") or price_min
-                if price_min:
-                    name = jld.get("name") or "Event"
-                    return float(price_min), float(price_max or price_min), name, url
+        # Try __NEXT_DATA__
+        nd = _extract_next_data(html)
+        if nd:
+            price = _find_price_in_obj(nd)
+            if price and price > 0:
+                name_m = re.search(r'"name"\s*:\s*"([^"]{5,80})"', html)
+                name = name_m.group(1) if name_m else "Event"
+                return price, price, name, url
 
-    # Try __NEXT_DATA__
-    nd = _extract_next_data(html)
-    if nd:
-        price = _find_price_in_obj(nd)
-        if price and price > 0:
-            # Try to find name
-            name_m = re.search(r'"name"\s*:\s*"([^"]{5,80})"', html)
-            name = name_m.group(1) if name_m else "Event"
-            return price, price, name, url
+        # Plain text "From $XX" or "Starting at $XX"
+        m = re.search(r"(?:From|Starting at|As low as)\s+\$(\d+(?:\.\d+)?)", html, re.IGNORECASE)
+        if m:
+            price = float(m.group(1))
+            name_m = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL)
+            name = re.sub(r"<[^>]+>", "", name_m.group(1)).strip() if name_m else "Event"
+            return price, price, name[:100], url
 
-    # Plain text "From $XX" or "Starting at $XX"
-    m = re.search(r"(?:From|Starting at|As low as)\s+\$(\d+(?:\.\d+)?)", html, re.IGNORECASE)
-    if m:
-        price = float(m.group(1))
-        name_m = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.DOTALL)
-        name = re.sub(r"<[^>]+>", "", name_m.group(1)).strip() if name_m else "Event"
-        return price, price, name[:100], url
+    # Apify fallback — handles JS-rendered pages and anti-bot blocks
+    if _apify and _apify.is_available():
+        logger.info("platform_monitor: StubHub page scrape failed, trying Apify for %s", url)
+        item = _apify.get_stubhub_price(url)
+        if item:
+            price = _apify.extract_price_from_result(item)
+            name = _apify.extract_name_from_result(item)
+            if price:
+                return price, price, name, url
 
     return None
 
@@ -423,41 +445,50 @@ def poll_stubhub_price(monitor: Dict[str, Any]) -> Optional[Tuple[Optional[float
 
 def poll_vividseats_price(monitor: Dict[str, Any]) -> Optional[Tuple[Optional[float], Optional[float], str, str]]:
     """
-    Poll a VividSeats monitor URL for lowest listing price via page scrape.
+    Poll a VividSeats monitor URL for lowest listing price.
+    Strategy: page scrape → Apify VividSeats actor (fallback if page blocked).
     Returns (price_min, price_max, event_name, event_url) or None.
     """
     url = monitor.get("url", "")
     proxies = monitor.get("proxies") or []
 
     html = _get_html(url, proxies=proxies)
-    if not html:
-        return None
+    if html:
+        # JSON-LD
+        for jld in _extract_jsonld(html):
+            if isinstance(jld, dict) and jld.get("@type") in ("Event", "MusicEvent", "SportsEvent"):
+                offers = jld.get("offers") or {}
+                if isinstance(offers, dict):
+                    price_min = offers.get("lowPrice") or offers.get("price")
+                    if price_min:
+                        name = jld.get("name") or "Event"
+                        price_max = offers.get("highPrice") or price_min
+                        return float(price_min), float(price_max or price_min), name, url
 
-    # JSON-LD
-    for jld in _extract_jsonld(html):
-        if isinstance(jld, dict) and jld.get("@type") in ("Event", "MusicEvent", "SportsEvent"):
-            offers = jld.get("offers") or {}
-            if isinstance(offers, dict):
-                price_min = offers.get("lowPrice") or offers.get("price")
-                if price_min:
-                    name = jld.get("name") or "Event"
-                    price_max = offers.get("highPrice") or price_min
-                    return float(price_min), float(price_max or price_min), name, url
+        # __NEXT_DATA__ / __INITIAL_STATE__
+        nd = _extract_next_data(html)
+        if nd:
+            price = _find_price_in_obj(nd)
+            if price and price > 0:
+                return price, price, "Event", url
 
-    # __NEXT_DATA__ / __INITIAL_STATE__
-    nd = _extract_next_data(html)
-    if nd:
-        price = _find_price_in_obj(nd)
-        if price and price > 0:
-            return price, price, "Event", url
+        # Search for embedded JSON with "minListPrice"
+        m = re.search(r'"minListPrice"\s*:\s*([\d.]+)', html)
+        if m:
+            price = float(m.group(1))
+            name_m = re.search(r'"name"\s*:\s*"([^"]{5,80})"', html)
+            name = name_m.group(1) if name_m else "Event"
+            return price, price, name, url
 
-    # Search for embedded JSON with "minListPrice"
-    m = re.search(r'"minListPrice"\s*:\s*([\d.]+)', html)
-    if m:
-        price = float(m.group(1))
-        name_m = re.search(r'"name"\s*:\s*"([^"]{5,80})"', html)
-        name = name_m.group(1) if name_m else "Event"
-        return price, price, name, url
+    # Apify fallback
+    if _apify and _apify.is_available():
+        logger.info("platform_monitor: VividSeats page scrape failed, trying Apify for %s", url)
+        item = _apify.get_vividseats_price(url)
+        if item:
+            price = _apify.extract_price_from_result(item)
+            name = _apify.extract_name_from_result(item)
+            if price:
+                return price, price, name, url
 
     return None
 
