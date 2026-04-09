@@ -26,10 +26,16 @@ import os
 import time
 from typing import Dict, Any, Optional
 
-import requests
-from dotenv import load_dotenv
+try:
+    import requests as _requests
+except ImportError:  # pragma: no cover
+    _requests = None  # type: ignore
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except ImportError:
+    pass
 
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
@@ -55,10 +61,12 @@ def _get_spotify_token() -> str:
     if _SPOTIFY_TOKEN and now < _SPOTIFY_TOKEN_EXPIRES_AT - 60:
         return _SPOTIFY_TOKEN
 
+    if not _requests:
+        raise RuntimeError("requests library not installed.")
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
         raise RuntimeError("SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET not configured.")
 
-    resp = requests.post(
+    resp = _requests.post(
         "https://accounts.spotify.com/api/token",
         data={"grant_type": "client_credentials"},
         auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
@@ -106,6 +114,9 @@ def get_spotify_metrics(artist_name: str) -> Dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"Spotify auth failed: {e}"}
 
+    if not _requests:
+        return {"ok": False, "error": "requests library not installed."}
+
     headers = {"Authorization": f"Bearer {token}"}
     params = {
         "q": artist_name,
@@ -113,17 +124,32 @@ def get_spotify_metrics(artist_name: str) -> Dict[str, Any]:
         "limit": 1,
     }
 
-    try:
-        resp = requests.get(
-            "https://api.spotify.com/v1/search",
-            headers=headers,
-            params=params,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        return {"ok": False, "error": f"Spotify search failed: {e}"}
+    for _attempt in range(2):
+        try:
+            resp = _requests.get(
+                "https://api.spotify.com/v1/search",
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+            if resp.status_code == 401 and _attempt == 0:
+                # Token expired mid-session — force refresh and retry once
+                global _SPOTIFY_TOKEN, _SPOTIFY_TOKEN_EXPIRES_AT
+                _SPOTIFY_TOKEN = None
+                _SPOTIFY_TOKEN_EXPIRES_AT = 0.0
+                try:
+                    token = _get_spotify_token()
+                    headers = {"Authorization": f"Bearer {token}"}
+                except Exception:
+                    pass
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as e:
+            return {"ok": False, "error": f"Spotify search failed: {e}"}
+    else:
+        return {"ok": False, "error": "Spotify search failed after token refresh."}
 
     artists = (data.get("artists") or {}).get("items") or []
     if not artists:
@@ -177,6 +203,8 @@ def get_youtube_metrics(artist_name: str) -> Dict[str, Any]:
     if not artist_name:
         return {"ok": False, "error": "Empty artist name."}
 
+    if not _requests:
+        return {"ok": False, "error": "requests library not installed."}
     if not YOUTUBE_API_KEY:
         return {"ok": False, "error": "YOUTUBE_API_KEY not configured."}
 
@@ -190,7 +218,7 @@ def get_youtube_metrics(artist_name: str) -> Dict[str, Any]:
     }
 
     try:
-        s_resp = requests.get(
+        s_resp = _requests.get(
             "https://www.googleapis.com/youtube/v3/search",
             params=search_params,
             timeout=20,
@@ -217,7 +245,7 @@ def get_youtube_metrics(artist_name: str) -> Dict[str, Any]:
     }
 
     try:
-        c_resp = requests.get(
+        c_resp = _requests.get(
             "https://www.googleapis.com/youtube/v3/channels",
             params=stats_params,
             timeout=20,

@@ -141,7 +141,7 @@
         {% if monitors %}
         <div class="table-responsive">
         <table class="data-table">
-          <thead><tr><th scope="col">Label</th><th scope="col">URL</th><th scope="col">Platform</th><th scope="col">Status</th><th scope="col">Alerts</th><th scope="col"></th></tr></thead>
+          <thead><tr><th scope="col">Label</th><th scope="col">URL</th><th scope="col">Platform</th><th scope="col">Price</th><th scope="col">Trend</th><th scope="col">Status</th><th scope="col">Alerts</th><th scope="col"></th></tr></thead>
           <tbody>
           {% for m in monitors %}
           <tr>
@@ -153,6 +153,19 @@
               {% elif p == 'stubhub' %}<span class="badge badge-stubhub" style="font-size:.68rem;">StubHub</span>
               {% elif p == 'vividseats' %}<span class="badge badge-vividseats" style="font-size:.68rem;">VividSeats</span>
               {% else %}<span class="badge badge-tm" style="font-size:.68rem;">TM</span>{% endif %}
+            </td>
+            <td class="price-cell">
+              {% if m.last_price_min is not none %}
+                <span class="price-val">${{ "%.0f"|format(m.last_price_min) }}</span>
+                {% if m.last_price_max and m.last_price_max != m.last_price_min %}
+                  <span class="price-sep">–</span><span class="price-val">${{ "%.0f"|format(m.last_price_max) }}</span>
+                {% endif %}
+              {% else %}
+                <span class="text-muted">—</span>
+              {% endif %}
+            </td>
+            <td>
+              <canvas class="price-sparkline" data-monitor-id="{{ m.id }}" width="80" height="28" aria-label="Price trend"></canvas>
             </td>
             <td>
               {% if m.last_status == 'onsale' %}<span class="badge badge-green"><span class="badge-dot"></span>On Sale</span>
@@ -333,6 +346,65 @@
     });
   }, { threshold: 0.4 });
   sections.forEach(id => { const el = document.getElementById(id); if (el) observer.observe(el); });
+
+  // Price sparklines — draw inline canvas charts from /api/monitors/:id/price_history
+  (function() {
+    function drawSparkline(canvas, points) {
+      if (!points || points.length < 2) {
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = 'rgba(255,255,255,0.15)';
+        ctx.fillRect(0, canvas.height/2 - 1, canvas.width, 2);
+        return;
+      }
+      const W = canvas.width, H = canvas.height, pad = 3;
+      const vals = points.map(p => p.price_min).filter(v => v != null);
+      if (!vals.length) return;
+      const mn = Math.min(...vals), mx = Math.max(...vals);
+      const range = mx - mn || 1;
+      const xs = vals.map((_, i) => pad + (i / (vals.length - 1)) * (W - pad * 2));
+      const ys = vals.map(v => H - pad - ((v - mn) / range) * (H - pad * 2));
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, W, H);
+      // Gradient fill
+      const grad = ctx.createLinearGradient(0, 0, 0, H);
+      grad.addColorStop(0, 'rgba(99,179,237,0.35)');
+      grad.addColorStop(1, 'rgba(99,179,237,0)');
+      ctx.beginPath();
+      ctx.moveTo(xs[0], H);
+      xs.forEach((x, i) => ctx.lineTo(x, ys[i]));
+      ctx.lineTo(xs[xs.length-1], H);
+      ctx.closePath();
+      ctx.fillStyle = grad;
+      ctx.fill();
+      // Line
+      ctx.beginPath();
+      ctx.moveTo(xs[0], ys[0]);
+      xs.forEach((x, i) => ctx.lineTo(x, ys[i]));
+      ctx.strokeStyle = '#63b3ed';
+      ctx.lineWidth = 1.5;
+      ctx.lineJoin = 'round';
+      ctx.stroke();
+      // End dot
+      ctx.beginPath();
+      ctx.arc(xs[xs.length-1], ys[ys.length-1], 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = vals[vals.length-1] < vals[0] ? '#68d391' : '#fc8181';
+      ctx.fill();
+    }
+
+    document.querySelectorAll('.price-sparkline').forEach(canvas => {
+      const mid = canvas.dataset.monitorId;
+      if (!mid) return;
+      fetch(`/api/monitors/${mid}/price_history`)
+        .then(r => r.ok ? r.json() : null)
+        .then(data => {
+          if (data && data.history) {
+            // history is newest-first; reverse for chronological chart
+            drawSparkline(canvas, data.history.slice().reverse());
+          }
+        })
+        .catch(() => {});
+    });
+  })();
 
   // Platform detection badge on URL input
   function updatePlatformBadge(url) {
